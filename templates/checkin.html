@@ -1,0 +1,265 @@
+{% extends "base.html" %}
+{% block title %}{{ center_name }} Check-In{% endblock %}
+{% block body_class %}kiosk{% endblock %}
+{% block content %}
+<div class="kiosk-wrap">
+  <header class="kiosk-header">
+    <h1>{{ center_name }}</h1>
+    <p class="subtitle">Tap your name to check in or check out</p>
+  </header>
+
+  <div class="search-wrap">
+    <input id="search" type="text" inputmode="search" autocomplete="off"
+           autocorrect="off" autocapitalize="words" spellcheck="false"
+           placeholder="Start typing your name…" aria-label="Search for your name"
+           role="combobox" aria-expanded="false" aria-autocomplete="list"
+           aria-controls="results" aria-haspopup="listbox">
+    <div id="results" class="suggestions hidden" role="listbox" aria-label="Matching names"></div>
+  </div>
+
+  <p id="hint" class="search-hint">Tap the box, then tap your name from the list.</p>
+
+  <div id="action-panel" class="action-panel hidden">
+    <div class="action-card">
+      <h2 id="action-name"></h2>
+      <p id="action-status" class="action-status"></p>
+      <div class="action-buttons">
+        <button id="btn-checkin" class="big-btn btn-checkin">Check In</button>
+        <button id="btn-checkout" class="big-btn btn-checkout">Check Out</button>
+      </div>
+      <button id="btn-cancel" class="link-btn">Not you? Go back</button>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <footer class="kiosk-footer">
+    <a href="{{ url_for('login') }}">Instructor Login</a>
+  </footer>
+</div>
+
+<script>
+let allStudents = [];
+let selectedStudent = null;
+let suggestions = [];      // students currently shown in the dropdown
+let activeIndex = -1;      // keyboard-highlighted row
+
+const searchEl = document.getElementById('search');
+const resultsEl = document.getElementById('results');
+const hintEl = document.getElementById('hint');
+
+async function loadStudents() {
+  const res = await fetch('/api/students');
+  allStudents = await res.json();
+  if (allStudents.length === 0) {
+    hintEl.textContent = 'No students on the list yet — ask your instructor to add you.';
+  }
+}
+
+/* Rank matches: names starting with the query come first, then names with a
+   word starting with it (last names), then anything else containing it. */
+function matchScore(name, q) {
+  const lower = name.toLowerCase();
+  if (!q) return 2;
+  if (lower.startsWith(q)) return 0;
+  if (lower.split(/\s+/).some(word => word.startsWith(q))) return 1;
+  if (lower.includes(q)) return 2;
+  return -1;
+}
+
+/* Bold the part of the name the student has typed so far. */
+function highlight(name, q) {
+  const idx = q ? name.toLowerCase().indexOf(q) : -1;
+  if (idx === -1) return document.createTextNode(name);
+  const frag = document.createDocumentFragment();
+  frag.appendChild(document.createTextNode(name.slice(0, idx)));
+  const mark = document.createElement('strong');
+  mark.textContent = name.slice(idx, idx + q.length);
+  frag.appendChild(mark);
+  frag.appendChild(document.createTextNode(name.slice(idx + q.length)));
+  return frag;
+}
+
+function closeSuggestions() {
+  suggestions = [];
+  activeIndex = -1;
+  resultsEl.innerHTML = '';
+  resultsEl.classList.add('hidden');
+  searchEl.setAttribute('aria-expanded', 'false');
+  searchEl.removeAttribute('aria-activedescendant');
+}
+
+function showSuggestions(query) {
+  const q = (query || '').trim().toLowerCase();
+  suggestions = allStudents
+    .map(s => ({ student: s, score: matchScore(s.name, q) }))
+    .filter(m => m.score >= 0)
+    .sort((a, b) => a.score - b.score || a.student.name.localeCompare(b.student.name))
+    .slice(0, 12)
+    .map(m => m.student);
+
+  resultsEl.innerHTML = '';
+  activeIndex = -1;
+  searchEl.removeAttribute('aria-activedescendant');
+
+  if (allStudents.length === 0) {
+    closeSuggestions();
+    return;
+  }
+
+  if (suggestions.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'no-match';
+    empty.textContent = 'No matching name. Ask your instructor for help.';
+    resultsEl.appendChild(empty);
+  } else {
+    suggestions.forEach((s, i) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'name-btn';
+      btn.id = `suggestion-${i}`;
+      btn.setAttribute('role', 'option');
+      btn.setAttribute('aria-selected', 'false');
+      btn.appendChild(highlight(s.name, q));
+      // mousedown fires before the input's blur, so the click isn't lost
+      btn.addEventListener('mousedown', e => e.preventDefault());
+      btn.addEventListener('click', () => selectStudent(s));
+      btn.addEventListener('mousemove', () => setActive(i));
+      resultsEl.appendChild(btn);
+    });
+  }
+
+  resultsEl.classList.remove('hidden');
+  searchEl.setAttribute('aria-expanded', 'true');
+}
+
+function setActive(index) {
+  const rows = resultsEl.querySelectorAll('.name-btn');
+  rows.forEach(r => { r.classList.remove('active'); r.setAttribute('aria-selected', 'false'); });
+  activeIndex = index;
+  if (index < 0 || index >= rows.length) {
+    searchEl.removeAttribute('aria-activedescendant');
+    return;
+  }
+  const row = rows[index];
+  row.classList.add('active');
+  row.setAttribute('aria-selected', 'true');
+  row.scrollIntoView({ block: 'nearest' });
+  searchEl.setAttribute('aria-activedescendant', row.id);
+}
+
+function onSearchKeydown(e) {
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (suggestions.length === 0) { showSuggestions(searchEl.value); return; }
+    const step = e.key === 'ArrowDown' ? 1 : -1;
+    const start = activeIndex === -1 ? (step === 1 ? -1 : 0) : activeIndex;
+    setActive((start + step + suggestions.length) % suggestions.length);
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    if (activeIndex >= 0) selectStudent(suggestions[activeIndex]);
+    else if (suggestions.length === 1) selectStudent(suggestions[0]);
+  } else if (e.key === 'Escape') {
+    closeSuggestions();
+  }
+}
+
+async function selectStudent(student) {
+  selectedStudent = student;
+  closeSuggestions();
+  searchEl.value = '';
+  document.getElementById('action-panel').classList.remove('hidden');
+  document.getElementById('action-name').textContent = student.name;
+
+  const statusRes = await fetch(`/api/students/${student.id}/status`);
+  const status = await statusRes.json();
+  const statusEl = document.getElementById('action-status');
+  const checkinBtn = document.getElementById('btn-checkin');
+  const checkoutBtn = document.getElementById('btn-checkout');
+
+  if (status.status === 'checked_in') {
+    statusEl.textContent = status.check_in_display
+      ? `You checked in at ${status.check_in_display}.`
+      : 'You are currently checked in.';
+    checkinBtn.classList.add('hidden');
+    checkoutBtn.classList.remove('hidden');
+  } else {
+    statusEl.textContent = 'You are not checked in yet.';
+    checkinBtn.classList.remove('hidden');
+    checkoutBtn.classList.add('hidden');
+  }
+}
+
+function resetPanel() {
+  selectedStudent = null;
+  document.getElementById('action-panel').classList.add('hidden');
+  searchEl.value = '';
+  closeSuggestions();
+  searchEl.focus();
+}
+
+function showToast(message, isError) {
+  const toast = document.getElementById('toast');
+  toast.textContent = message;
+  toast.classList.remove('hidden', 'toast-error', 'toast-success');
+  toast.classList.add(isError ? 'toast-error' : 'toast-success');
+  setTimeout(() => toast.classList.add('hidden'), 4000);
+}
+
+let actionInFlight = false;
+
+async function doAction(endpoint, button) {
+  // Sending the parent's email takes a moment. Without this guard an impatient
+  // student taps Check Out repeatedly, and every tap is another request.
+  if (!selectedStudent || actionInFlight) return;
+  actionInFlight = true;
+
+  const checkinBtn = document.getElementById('btn-checkin');
+  const checkoutBtn = document.getElementById('btn-checkout');
+  const cancelBtn = document.getElementById('btn-cancel');
+  const originalLabel = button.textContent;
+  const student = selectedStudent;
+
+  checkinBtn.disabled = checkoutBtn.disabled = cancelBtn.disabled = true;
+  button.textContent = 'One moment…';
+  button.classList.add('is-working');
+
+  try {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ student_id: student.id }),
+    });
+    const data = await res.json();
+    showToast(data.message || data.error, !res.ok);
+    resetPanel();
+  } catch (err) {
+    // Network dropped or the server is down - say so instead of hanging on
+    // "One moment…" forever with no way back.
+    showToast("Couldn't reach the check-in system. Please tell your instructor.", true);
+    resetPanel();
+  } finally {
+    button.textContent = originalLabel;
+    button.classList.remove('is-working');
+    checkinBtn.disabled = checkoutBtn.disabled = cancelBtn.disabled = false;
+    actionInFlight = false;
+  }
+}
+
+searchEl.addEventListener('input', e => showSuggestions(e.target.value));
+searchEl.addEventListener('focus', () => showSuggestions(searchEl.value));
+searchEl.addEventListener('keydown', onSearchKeydown);
+searchEl.addEventListener('blur', () => setTimeout(closeSuggestions, 120));
+
+// Tapping anywhere outside the search box closes the list.
+document.addEventListener('click', e => {
+  if (!e.target.closest('.search-wrap')) closeSuggestions();
+});
+
+document.getElementById('btn-checkin').addEventListener('click', e => doAction('/api/checkin', e.currentTarget));
+document.getElementById('btn-checkout').addEventListener('click', e => doAction('/api/checkout', e.currentTarget));
+document.getElementById('btn-cancel').addEventListener('click', resetPanel);
+
+loadStudents().then(() => searchEl.focus());
+</script>
+{% endblock %}

@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block body_class %}dashboard-page{% endblock %}
+{% block content %}
+<div class="dash-wrap">
+  <header class="dash-header">
+    <h1>Instructor Dashboard</h1>
+    <div class="dash-header-right">
+      <span class="student-count">{{ student_count }} active students</span>
+      <a class="link-btn" href="{{ url_for('logout') }}">Log out</a>
+    </div>
+  </header>
+
+  <section class="dash-controls">
+    <form method="get" class="date-form">
+      <label for="date">Viewing</label>
+      <input type="date" id="date" name="date" value="{{ selected_date }}" max="{{ today }}"
+             onchange="this.form.submit()">
+    </form>
+  </section>
+
+  <p class="section-note">Showing {{ selected_date|datelong }}</p>
+
+  <section class="dash-table-wrap">
+    <table class="dash-table">
+      <thead>
+        <tr>
+          <th>Student</th>
+          <th>Check-In</th>
+          <th>Check-Out</th>
+          <th>Parent Email</th>
+          <th>Email Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for v in visits %}
+        <tr>
+          <td>{{ v.name }}</td>
+          <td>{{ v.check_in_time|time12 }}</td>
+          <td>
+            {% if v.check_out_time %}
+              {{ v.check_out_time|time12 }}
+              {% if v.email_status == 'auto_closed' %}<span class="auto-note">auto</span>{% endif %}
+            {% else %}
+              Still checked in
+            {% endif %}
+          </td>
+          <td class="email-cell">{{ v.email_masked }}</td>
+          <td>
+            {% if v.email_status == 'sent' %}
+              <span class="badge badge-ok">Sent</span>
+            {% elif v.email_status == 'failed' %}
+              <span class="badge badge-bad">Failed</span>
+            {% elif v.email_status == 'not_configured' %}
+              <span class="badge badge-warn">Not configured</span>
+            {% elif v.email_status == 'no_address' %}
+              <span class="badge badge-bad">No email on file</span>
+            {% elif v.email_status == 'auto_closed' %}
+              <span class="badge badge-muted" title="Forgot to check out — closed automatically at {{ close_time_display }}. No email sent.">No email (forgot to check out)</span>
+            {% else %}
+              <span class="badge badge-muted">—</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="empty-row">No check-ins for this date yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+
+  <section class="dash-students">
+    <h2>Manage Students</h2>
+    <form method="post" action="{{ url_for('add_student') }}" class="add-student-form">
+      <input type="text" name="name" placeholder="Student name" required>
+      <input type="email" name="email" placeholder="Parent email, e.g. parent@example.com" required>
+      <button type="submit" class="big-btn small">Add Student</button>
+    </form>
+
+    <details class="student-list-details">
+      <summary>View / edit / remove current students ({{ student_count }})</summary>
+      <p class="section-note">
+        To change a parent's email, type the new address next to the student and press Save.
+      </p>
+      <ul class="student-manage-list">
+        {% for s in students %}
+        <li>
+          <div class="student-row-main">
+            <span class="student-row-name">{{ s.name }}</span>
+            <span class="student-row-email">{{ s.email_masked }}</span>
+          </div>
+          <div class="student-row-actions">
+            <form method="post" action="{{ url_for('update_student_email', student_id=s.id) }}"
+                  class="update-email-form">
+              <input type="email" name="email" placeholder="New parent email"
+                     aria-label="New email for {{ s.name }}" required>
+              <button type="submit" class="link-btn">Save</button>
+            </form>
+            <form method="post" action="{{ url_for('deactivate_student', student_id=s.id) }}"
+                  onsubmit="return confirm('Remove {{ s.name }} from the check-in list?');">
+              <button type="submit" class="link-btn danger">Remove</button>
+            </form>
+          </div>
+        </li>
+        {% else %}
+        <li class="empty-row">No students yet.</li>
+        {% endfor %}
+      </ul>
+    </details>
+  </section>
+
+  <section class="dash-reports">
+    <h2>Session Reports</h2>
+    <p class="section-note">
+      Emailed automatically on {{ report_days_display }} at {{ close_time_display }},
+      after everyone still checked in is closed out for the night.
+      Reports are built fresh each time you download one, so nothing expires —
+      and you can pull any date, not just session days.
+    </p>
+    {% if session_dates %}
+    <ul class="reports-list">
+      {% for d in session_dates %}
+      <li>
+        <span>{{ d|datelong }}</span>
+        <a href="{{ url_for('download_report', report_date=d.isoformat()) }}">Download PDF</a>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty-row">No session days configured.</p>
+    {% endif %}
+    <div class="report-any-date">
+      <label for="reportDate">Any other date</label>
+      <input type="date" id="reportDate" value="{{ today }}" max="{{ today }}">
+      <button type="button" onclick="location.href='/dashboard/reports/' + document.getElementById('reportDate').value">
+        Download PDF
+      </button>
+    </div>
+  </section>
+</div>
+{% endblock %}

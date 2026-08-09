@@ -1,5 +1,6 @@
 import io
 import os
+import secrets
 from datetime import datetime, date, timedelta
 from functools import wraps
 
@@ -58,7 +59,10 @@ def create_app():
         Returns None for anything that isn't a number, which the callers turn
         into a 404 the same as an unknown student.
         """
-        raw = request.json.get("student_id") if request.is_json else request.form.get("student_id")
+        # silent=True so a malformed body returns None instead of raising, and
+        # `or {}` because a bare "null" body parses to None rather than a dict.
+        payload = request.get_json(silent=True) or {}
+        raw = payload.get("student_id", request.form.get("student_id"))
         try:
             return int(raw)
         except (TypeError, ValueError):
@@ -212,7 +216,15 @@ def create_app():
             if row and check_password_hash(row["password_hash"], password):
                 session.clear()
                 session["instructor_id"] = row["id"]
-                return redirect(request.args.get("next") or url_for("dashboard"))
+                # Only same-site paths. login_required only ever sets `next` to
+                # a local path, but the URL is user-supplied, so "next=https://
+                # elsewhere" would otherwise hand a freshly logged-in instructor
+                # to another site. "//host" is a protocol-relative URL, so it
+                # has to be rejected too even though it starts with a slash.
+                nxt = request.args.get("next") or ""
+                if not nxt.startswith("/") or nxt.startswith("//"):
+                    nxt = url_for("dashboard")
+                return redirect(nxt)
             flash("Incorrect username or password.")
         return render_template("login.html")
 
@@ -226,7 +238,15 @@ def create_app():
     @login_required
     def dashboard():
         db = get_db()
-        day_str = request.args.get("date") or local_today().isoformat()
+        # Validated before it reaches SQL: Postgres raises on a malformed date
+        # rather than returning nothing, which would 500 the page and leave the
+        # connection in a failed transaction.
+        day_str = request.args.get("date") or ""
+        try:
+            day_str = date.fromisoformat(day_str).isoformat()
+        except ValueError:
+            day_str = local_today().isoformat()
+
         rows = db.execute(
             """
             SELECT v.id, s.name AS name, v.check_in_time, v.check_out_time, v.email_status, s.email_enc
@@ -286,11 +306,26 @@ def create_app():
             return redirect(url_for("dashboard"))
 
         db = get_db()
+        # Matched without filtering on `active` on purpose. "Removed" students
+        # are only deactivated, never deleted, so filtering would insert a
+        # second row with the same name - and import_students.py matches on name
+        # alone, so it would then update whichever of the two it happened to
+        # find first. Re-adding someone reactivates the row that already exists.
         existing = db.execute(
-            "SELECT id FROM students WHERE name = %s AND active = 1", (name,)
+            "SELECT id, active FROM students WHERE name = %s", (name,)
         ).fetchone()
-        if existing:
+
+        if existing and existing["active"]:
             flash(f"A student named '{name}' is already on the list.")
+            return redirect(url_for("dashboard"))
+
+        if existing:
+            db.execute(
+                "UPDATE students SET email_enc = %s, active = 1 WHERE id = %s",
+                (encrypt_email(email), existing["id"]),
+            )
+            db.commit()
+            flash(f"{name} was previously removed — added back with that email.")
             return redirect(url_for("dashboard"))
 
         db.execute(
@@ -387,8 +422,11 @@ def create_app():
     @app.route("/api/cron/nightly-close", methods=["GET", "POST"])
     def cron_nightly_close():
         expected = os.environ.get("CRON_SECRET")
-        if not expected or request.headers.get("Authorization") != f"Bearer {expected}":
-            # Without this, anyone who found the URL could close out the center.
+        supplied = request.headers.get("Authorization", "")
+        # compare_digest rather than != so the comparison doesn't return early
+        # on the first wrong character. Without this check at all, anyone who
+        # found the URL could close out the center.
+        if not expected or not secrets.compare_digest(supplied, f"Bearer {expected}"):
             return jsonify({"error": "unauthorized"}), 401
 
         closed = _close_open_visits()

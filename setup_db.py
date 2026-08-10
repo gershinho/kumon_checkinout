@@ -18,13 +18,20 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 load_dotenv()
 
-from db import SCHEMA, connect  # noqa: E402
+from db import LOCKDOWN, SCHEMA, connect  # noqa: E402
 
 
 def create_schema(conn):
     conn.execute(SCHEMA)
     conn.commit()
     print("Schema ready (tables, indexes, one-open-visit constraint).")
+
+
+def lock_down_public_access(conn):
+    """Take away the access Supabase's public REST API is granted by default."""
+    conn.execute(LOCKDOWN)
+    conn.commit()
+    print("Locked down: student data is not reachable from Supabase's public API.")
 
 
 def sync_instructor_account(conn):
@@ -136,6 +143,7 @@ def main():
 
     with connect() as conn:
         create_schema(conn)
+        lock_down_public_access(conn)
         if args.migrate:
             migrate_from_sqlite(conn, args.migrate)
         sync_instructor_account(conn)

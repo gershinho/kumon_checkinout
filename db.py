@@ -98,6 +98,48 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_visits_one_open
 """
 
 
+# Shut the front door Supabase leaves open.
+#
+# Supabase runs an automatic REST API over the public schema, reachable with the
+# project's "anon" key - a key designed to be published in browser code. New
+# tables are granted to that role by default and start with Row Level Security
+# switched off, so out of the box every student name and visit is readable, and
+# writable, by anyone holding a key that is meant to be public.
+#
+# This app never uses that API; it connects straight to Postgres as the owning
+# role. So the safe thing is to take the API's access away entirely: revoke the
+# grants, revoke the default that would re-grant them on the next new table, and
+# turn RLS on as a second layer that denies by default because no policy allows
+# anything. The app is unaffected - its role owns these tables and bypasses RLS.
+#
+# Wrapped in a role check so this still runs against a plain Postgres (a local
+# one, say), where "anon" and "authenticated" don't exist.
+LOCKDOWN = """
+DO $$
+DECLARE
+    web_role text;
+BEGIN
+    FOREACH web_role IN ARRAY ARRAY['anon', 'authenticated'] LOOP
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = web_role) THEN
+            EXECUTE format('REVOKE ALL ON ALL TABLES IN SCHEMA public FROM %I', web_role);
+            EXECUTE format('REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM %I', web_role);
+            EXECUTE format(
+                'ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM %I',
+                web_role);
+            EXECUTE format(
+                'ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM %I',
+                web_role);
+        END IF;
+    END LOOP;
+END $$;
+
+ALTER TABLE students      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE visits        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE instructors   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE login_attempts ENABLE ROW LEVEL SECURITY;
+"""
+
+
 def init_db(app):
     """Wire up connection teardown for the app.
 

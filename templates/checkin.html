@@ -24,8 +24,11 @@
       <h2 id="action-name"></h2>
       <p id="action-status" class="action-status"></p>
       <div class="action-buttons">
-        <button id="btn-checkin" class="big-btn btn-checkin">Check In</button>
-        <button id="btn-checkout" class="big-btn btn-checkout">Check Out</button>
+        {# Both start hidden. Whether a student can check in or out isn't known
+           until the server answers, and showing both in the meantime made the
+           wrong one flash up for a moment on every single tap. #}
+        <button id="btn-checkin" class="big-btn btn-checkin hidden">Check In</button>
+        <button id="btn-checkout" class="big-btn btn-checkout hidden">Check Out</button>
       </div>
       <button id="btn-cancel" class="link-btn">Not you? Go back</button>
     </div>
@@ -183,26 +186,43 @@ async function selectStudent(student) {
   selectedStudent = student;
   closeSuggestions();
   searchEl.value = '';
-  document.getElementById('action-panel').classList.remove('hidden');
-  document.getElementById('action-name').textContent = student.name;
 
-  const statusRes = await fetch(`/api/students/${student.id}/status`);
-  if (isLocked(statusRes)) { goToLogin(); return; }
-  const status = await statusRes.json();
   const statusEl = document.getElementById('action-status');
   const checkinBtn = document.getElementById('btn-checkin');
   const checkoutBtn = document.getElementById('btn-checkout');
+
+  // Neither button until the server says which one is right. Opening the panel
+  // with both showing meant the wrong one appeared for a moment and then
+  // disappeared, which reads as a glitch and invites a mis-tap.
+  checkinBtn.classList.add('hidden');
+  checkoutBtn.classList.add('hidden');
+  statusEl.textContent = 'One moment…';
+  document.getElementById('action-panel').classList.remove('hidden');
+  document.getElementById('action-name').textContent = student.name;
+
+  let status;
+  try {
+    const statusRes = await fetch(`/api/students/${student.id}/status`);
+    if (isLocked(statusRes)) { goToLogin(); return; }
+    status = await statusRes.json();
+  } catch (err) {
+    statusEl.textContent = "Couldn't reach the check-in system. Please tell your instructor.";
+    return;
+  }
+
+  // A student who taps one name and then quickly another can have the first
+  // reply land second. Without this the panel would show the newer name beside
+  // the older student's buttons.
+  if (selectedStudent !== student) return;
 
   if (status.status === 'checked_in') {
     statusEl.textContent = status.check_in_display
       ? `You checked in at ${status.check_in_display}.`
       : 'You are currently checked in.';
-    checkinBtn.classList.add('hidden');
     checkoutBtn.classList.remove('hidden');
   } else {
     statusEl.textContent = 'You are not checked in yet.';
     checkinBtn.classList.remove('hidden');
-    checkoutBtn.classList.add('hidden');
   }
 }
 

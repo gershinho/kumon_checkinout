@@ -399,11 +399,12 @@ def create_app():
             visits=visits,
             selected_date=day_str,
             today=local_today().isoformat(),
-            session_dates=recent_session_dates(),
+            session_dates=report_dates(),
             students=students,
             student_count=len(students),
             close_time_display=fmt_time(datetime.combine(local_today(), closing)),
             report_days_display=_report_days_display(),
+            min_visits_for_email=MIN_VISITS_FOR_EMAILED_REPORT,
         )
 
     @app.post("/dashboard/students")
@@ -511,6 +512,12 @@ def create_app():
             flash("That isn't a valid date.")
             return redirect(url_for("dashboard"))
 
+        # The date picker sets max="today", but the URL is typed as easily as
+        # it is clicked, and a future date can only ever produce a blank PDF.
+        if day > local_today():
+            flash("That date hasn't happened yet.")
+            return redirect(url_for("dashboard"))
+
         buf = build_report_pdf(day)
         return send_file(
             buf,
@@ -552,10 +559,20 @@ def create_app():
         result = {"closed": closed, "date": session_day.isoformat(), "report": "skipped"}
 
         if is_report_day(session_day):
-            buf = build_report_pdf(session_day)
-            result["report"] = send_report_email(
-                buf.getvalue(), f"report_{session_day.isoformat()}.pdf", session_day
-            )
+            # A Monday that falls on a holiday is still a Monday, and the old
+            # code cheerfully emailed an empty PDF for it. Below the threshold
+            # nothing is built and nothing is sent - the visits are still in the
+            # database either way, so the report is downloadable from the
+            # dashboard if a quiet day turns out to be worth looking at.
+            attended = count_visits(session_day)
+            result["visits"] = attended
+            if attended > MIN_VISITS_FOR_EMAILED_REPORT:
+                buf = build_report_pdf(session_day)
+                result["report"] = send_report_email(
+                    buf.getvalue(), f"report_{session_day.isoformat()}.pdf", session_day
+                )
+            else:
+                result["report"] = f"skipped_quiet_day({attended})"
 
         app.logger.info("Nightly close: %s", result)
         return jsonify(result)
@@ -564,6 +581,11 @@ def create_app():
 
 
 DEFAULT_SESSION_DATES_SHOWN = 10
+
+# A session day with this many check-ins or fewer doesn't get an emailed report.
+# Guards against a holiday Monday producing a blank PDF in the inbox. Nothing is
+# lost when it triggers: the day is still downloadable from the dashboard.
+MIN_VISITS_FOR_EMAILED_REPORT = 3
 
 # How long a run of failed logins is remembered, and how many are allowed in it.
 LOGIN_WINDOW_MINUTES = 15
@@ -684,24 +706,40 @@ def _clear_login_attempts():
         db.rollback()
 
 
-def recent_session_dates(count=DEFAULT_SESSION_DATES_SHOWN):
-    """The most recent days the center ran, newest first.
+def report_dates(count=DEFAULT_SESSION_DATES_SHOWN):
+    """Dates worth offering a report for: today, plus past days that actually
+    have check-ins recorded. Newest first.
 
-    This replaces the old list of saved report files. Since any date's report
-    can be rebuilt on demand, the dashboard just needs to know which days are
-    worth offering - and there's no longer a limit on how far back you can go.
+    This used to be worked out from the calendar - every Monday and Thursday
+    going back weeks, regardless of whether the center had met on any of them.
+    That offered a download for days that could only ever produce an empty PDF,
+    including dates from before the system existed. Asking the database which
+    days have visits means the list only ever contains reports with something
+    in them.
+
+    Today is always offered even when it's empty, so the instructor can pull a
+    partial report during a session that's still running.
     """
-    days = []
-    day = local_today()
-    # Enough lookback to find `count` session days even on a one-day-a-week
-    # schedule, without an unbounded loop if REPORT_DAYS is somehow empty.
-    for _ in range(count * 7 + 7):
-        if is_report_day(day):
-            days.append(day)
-            if len(days) >= count:
-                break
-        day -= timedelta(days=1)
-    return days
+    db = get_db()
+    today = local_today()
+    rows = db.execute(
+        "SELECT DISTINCT check_in_time::date AS day FROM visits "
+        "WHERE check_in_time::date <= %s::date "
+        "ORDER BY day DESC LIMIT %s",
+        (today.isoformat(), count),
+    ).fetchall()
+    days = [r["day"] for r in rows]
+    if today not in days:
+        days.insert(0, today)
+    return days[:count]
+
+
+def count_visits(day) -> int:
+    db = get_db()
+    return db.execute(
+        "SELECT count(*) AS n FROM visits WHERE check_in_time::date = %s::date",
+        (day.isoformat(),),
+    ).fetchone()["n"]
 
 
 def _report_days_display() -> str:

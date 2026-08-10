@@ -7,6 +7,9 @@
     <h1>Instructor Dashboard</h1>
     <div class="dash-header-right">
       <span class="student-count">{{ student_count }} active students</span>
+      {# No second login needed going this way: reaching the dashboard already
+         proved you know the password. Only the reverse direction re-asks. #}
+      <a class="link-btn" href="{{ url_for('kiosk') }}">Back to check-in</a>
       <a class="link-btn" href="{{ url_for('logout') }}">Log out</a>
     </div>
   </header>
@@ -115,10 +118,11 @@
   <section class="dash-reports">
     <h2>Session Reports</h2>
     <p class="section-note">
-      Emailed automatically on {{ report_days_display }} at {{ close_time_display }},
-      after everyone still checked in is closed out for the night.
-      Reports are built fresh each time you download one, so nothing expires —
-      and you can pull any date, not just session days.
+      Emailed automatically on {{ report_days_display }} after closing, once
+      everyone still checked in has been closed out for the night — unless fewer
+      than {{ min_visits_for_email + 1 }} students came in, so a holiday doesn't
+      send you a blank report. Quiet days are still downloadable here.
+      Reports are built fresh each time, so nothing expires.
     </p>
     {% if session_dates %}
     <ul class="reports-list">

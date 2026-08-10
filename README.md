@@ -183,19 +183,24 @@ hitting `/api/cron/nightly-close` with the `CRON_SECRET` header.
 ## Deploying to Vercel
 
 `vercel.json`, `.python-version`, and `api/index.py` are already set up. Push the
-repo to GitHub, import it in Vercel, and set **every variable from your `.env`**
-in Project Settings → Environment Variables — especially `DATABASE_URL`,
-`EMAIL_ENCRYPTION_KEY`, `SECRET_KEY`, `REPORT_TIMEZONE`, and the `INSTRUCTOR_*`
-pair. Then run `python setup_db.py` once from your own machine, pointed at the
-production `DATABASE_URL`, to create the tables.
+repo to GitHub, import it in Vercel, and set every variable from your `.env` in
+Project Settings → Environment Variables **except `INSTRUCTOR_USERNAME` and
+`INSTRUCTOR_PASSWORD`** — the running app never reads those two. They are only
+used by `setup_db.py`, which you run from your own machine, so there is no
+reason to keep a copy of your password in the cloud.
+
+Then run `python setup_db.py` once with the production `DATABASE_URL` in your
+local `.env` to create the tables.
 
 `SECRET_KEY` is not optional in production: without it the app refuses to start
 rather than fall back to a placeholder that anyone reading this repository could
 use to forge an instructor session.
 
 The cron entry in `vercel.json` calls `/api/cron/nightly-close` daily at
-`05:00 UTC` — midnight Central in summer, 11 PM in winter. Vercel provides
-`CRON_SECRET` automatically; the endpoint refuses any request without it.
+`05:00 UTC` — midnight Central in summer, 11 PM in winter. Set `CRON_SECRET`
+yourself as an environment variable; Vercel then attaches it to the scheduled
+request automatically, and the endpoint refuses anything that arrives without
+it.
 
 An hour earlier would also land after the 10 PM close, but in winter it would
 land *exactly* on it, and "which session just ended" is decided by comparing

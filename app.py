@@ -153,7 +153,7 @@ def create_app():
     @app.route("/")
     @kiosk_required
     def kiosk():
-        return render_template("checkin.html", center_name=os.environ.get("CENTER_NAME", "Kumon"))
+        return render_template("checkin.html", center_name=center_name())
 
     @app.get("/api/students")
     @kiosk_required
@@ -562,6 +562,16 @@ LOGIN_WINDOW_MINUTES = 15
 LOGIN_MAX_ATTEMPTS = 10
 
 
+def center_name() -> str:
+    """The center's name, for the kiosk, the parent emails and the PDF.
+
+    One function so there is one default. The PDF used to fall back to "Kumon
+    Center" while everywhere else fell back to "Kumon", which meant leaving
+    CENTER_NAME unset quietly retitled the report but nothing else.
+    """
+    return (os.environ.get("CENTER_NAME") or "").strip() or "Kumon"
+
+
 def _static_version() -> str:
     """A stamp that changes when the stylesheet does, used as a cache buster.
 
@@ -755,7 +765,7 @@ def build_report_pdf(report_date) -> io.BytesIO:
     buf = io.BytesIO()
     generate_report_pdf(
         report_date, visits, buf,
-        center_name=os.environ.get("CENTER_NAME", "Kumon Center"),
+        center_name=center_name(),
     )
     buf.seek(0)
     return buf

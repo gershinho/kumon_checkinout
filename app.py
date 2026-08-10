@@ -13,7 +13,9 @@ from dotenv import load_dotenv
 import psycopg
 
 from db import get_db, init_db
-from crypto_utils import decrypt_email, encrypt_email, mask_email, normalize_email
+from crypto_utils import (
+    assert_configured, decrypt_email, encrypt_email, mask_email, normalize_email,
+)
 from email_utils import send_checkout_email, send_report_email
 from pdf_report import generate_report_pdf
 from time_utils import (
@@ -45,6 +47,12 @@ def create_app():
             )
         secret_key = "dev-key-change-me"
     app.secret_key = secret_key
+
+    # Same reasoning, for the key that makes parent addresses readable. Checked
+    # here so a misconfigured deployment says so on the first request instead of
+    # serving a kiosk that quietly cannot complete a check-out.
+    if in_production:
+        assert_configured()
 
     # Nothing is written to disk any more: reports are built in memory when
     # asked for, and failed emails are logged to stdout. Serverless hosts give

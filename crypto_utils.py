@@ -18,6 +18,28 @@ def _get_fernet():
     return Fernet(key.encode() if isinstance(key, str) else key)
 
 
+def assert_configured():
+    """Raise at startup if the key is missing or unusable.
+
+    Without this the app boots happily and then fails with a 500 on exactly the
+    two paths that decrypt - the dashboard, and check-out. Check-out is the bad
+    one: it claims the visit before it decrypts, so the student is recorded as
+    checked out and *then* shown an error, with no email sent. A missing
+    environment variable should not be discoverable only by a student pressing
+    a button.
+    """
+    try:
+        _get_fernet()
+    except EncryptionNotConfigured:
+        raise
+    except Exception as exc:  # noqa: BLE001 - malformed key, whatever the cause
+        raise EncryptionNotConfigured(
+            f"EMAIL_ENCRYPTION_KEY is set but unusable ({type(exc).__name__}). "
+            "It must be the 44-character Fernet key you generated, copied exactly "
+            "- no quotes, no spaces, no line break, and the trailing '=' included."
+        ) from exc
+
+
 def encrypt_email(email: str) -> bytes:
     f = _get_fernet()
     return f.encrypt(email.encode("utf-8"))

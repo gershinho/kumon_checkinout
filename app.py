@@ -166,29 +166,32 @@ def create_app():
     @app.get("/api/students")
     @kiosk_required
     def api_students():
+        """The roster, each name already carrying whether they're checked in.
+
+        This used to return names only, which meant the kiosk had to make a
+        second request the moment a student tapped their name, and couldn't
+        show the right button until it came back. Sending the status up front
+        is a few extra bytes per student and removes that wait entirely.
+
+        The LEFT JOIN can't multiply rows: the unique index on open visits
+        guarantees at most one per student.
+        """
         db = get_db()
         rows = db.execute(
-            "SELECT id, name FROM students WHERE active = 1 ORDER BY name"
+            "SELECT s.id, s.name, v.check_in_time "
+            "FROM students s "
+            "LEFT JOIN visits v ON v.student_id = s.id AND v.check_out_time IS NULL "
+            "WHERE s.active = 1 ORDER BY s.name"
         ).fetchall()
-        return jsonify([{"id": r["id"], "name": r["name"]} for r in rows])
-
-    @app.get("/api/students/<int:student_id>/status")
-    @kiosk_required
-    def api_student_status(student_id):
-        db = get_db()
-        open_visit = db.execute(
-            "SELECT id, check_in_time FROM visits "
-            "WHERE student_id = %s AND check_out_time IS NULL "
-            "ORDER BY check_in_time DESC LIMIT 1",
-            (student_id,),
-        ).fetchone()
-        if open_visit:
-            return jsonify({
-                "status": "checked_in",
-                "check_in_time": open_visit["check_in_time"],
-                "check_in_display": fmt_time(open_visit["check_in_time"]),
-            })
-        return jsonify({"status": "checked_out"})
+        return jsonify([
+            {
+                "id": r["id"],
+                "name": r["name"],
+                "checked_in": r["check_in_time"] is not None,
+                "check_in_display": fmt_time(r["check_in_time"]) if r["check_in_time"] else None,
+            }
+            for r in rows
+        ])
 
     @app.post("/api/checkin")
     @kiosk_required

@@ -182,7 +182,9 @@ function onSearchKeydown(e) {
   }
 }
 
-async function selectStudent(student) {
+/* No waiting and no second request: the roster already says who is checked in,
+   so the right button is decided here and now. Exactly one is ever shown. */
+function selectStudent(student) {
   selectedStudent = student;
   closeSuggestions();
   searchEl.value = '';
@@ -191,39 +193,20 @@ async function selectStudent(student) {
   const checkinBtn = document.getElementById('btn-checkin');
   const checkoutBtn = document.getElementById('btn-checkout');
 
-  // Neither button until the server says which one is right. Opening the panel
-  // with both showing meant the wrong one appeared for a moment and then
-  // disappeared, which reads as a glitch and invites a mis-tap.
-  checkinBtn.classList.add('hidden');
-  checkoutBtn.classList.add('hidden');
-  statusEl.textContent = 'One moment…';
-  document.getElementById('action-panel').classList.remove('hidden');
-  document.getElementById('action-name').textContent = student.name;
-
-  let status;
-  try {
-    const statusRes = await fetch(`/api/students/${student.id}/status`);
-    if (isLocked(statusRes)) { goToLogin(); return; }
-    status = await statusRes.json();
-  } catch (err) {
-    statusEl.textContent = "Couldn't reach the check-in system. Please tell your instructor.";
-    return;
-  }
-
-  // A student who taps one name and then quickly another can have the first
-  // reply land second. Without this the panel would show the newer name beside
-  // the older student's buttons.
-  if (selectedStudent !== student) return;
-
-  if (status.status === 'checked_in') {
-    statusEl.textContent = status.check_in_display
-      ? `You checked in at ${status.check_in_display}.`
+  if (student.checked_in) {
+    statusEl.textContent = student.check_in_display
+      ? `You checked in at ${student.check_in_display}.`
       : 'You are currently checked in.';
+    checkinBtn.classList.add('hidden');
     checkoutBtn.classList.remove('hidden');
   } else {
     statusEl.textContent = 'You are not checked in yet.';
+    checkoutBtn.classList.add('hidden');
     checkinBtn.classList.remove('hidden');
   }
+
+  document.getElementById('action-name').textContent = student.name;
+  document.getElementById('action-panel').classList.remove('hidden');
 }
 
 function resetPanel() {
@@ -268,6 +251,20 @@ async function doAction(endpoint, button) {
     });
     if (isLocked(res)) { goToLogin(); return; }
     const data = await res.json();
+
+    if (res.ok) {
+      // Keep the cached roster in step, so tapping the same name again
+      // immediately offers the opposite button. `student` is the very object
+      // held in allStudents, so updating it updates the list.
+      const checkedIn = endpoint === '/api/checkin';
+      student.checked_in = checkedIn;
+      student.check_in_display = checkedIn ? data.time_display : null;
+    } else {
+      // The server disagreed with what we believed - most likely this tablet's
+      // list is stale. Re-read it so the next student isn't shown a guess.
+      loadStudents();
+    }
+
     showToast(data.message || data.error, !res.ok);
     resetPanel();
   } catch (err) {
@@ -296,6 +293,19 @@ document.addEventListener('click', e => {
 document.getElementById('btn-checkin').addEventListener('click', e => doAction('/api/checkin', e.currentTarget));
 document.getElementById('btn-checkout').addEventListener('click', e => doAction('/api/checkout', e.currentTarget));
 document.getElementById('btn-cancel').addEventListener('click', resetPanel);
+
+/* A tablet is left running for a whole session, and sometimes overnight. The
+   nightly close-out happens on the server with nobody tapping anything, so
+   without this the kiosk would still be showing yesterday's statuses in the
+   morning. Skipped while a student has the panel open, so the list is never
+   swapped out from under someone mid-tap. */
+function refreshRoster() {
+  if (!selectedStudent) loadStudents();
+}
+setInterval(refreshRoster, 5 * 60 * 1000);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) refreshRoster();
+});
 
 loadStudents().then(() => searchEl.focus());
 </script>

@@ -26,7 +26,25 @@ load_dotenv()
 
 def create_app():
     app = Flask(__name__)
-    app.secret_key = os.environ.get("SECRET_KEY", "dev-key-change-me")
+
+    # Vercel sets VERCEL=1, which is a reliable "am I in production" signal.
+    in_production = bool(os.environ.get("VERCEL"))
+
+    # Refuse to start in production without a real key rather than falling back
+    # to one that is published in this repository. Session cookies are signed
+    # with it, so a forgotten environment variable would let anyone mint their
+    # own "I am the instructor" cookie - and nothing about the running app would
+    # look wrong.
+    secret_key = os.environ.get("SECRET_KEY")
+    if not secret_key:
+        if in_production:
+            raise RuntimeError(
+                "SECRET_KEY is not set. Add it in Vercel: Project Settings -> "
+                "Environment Variables. Generate one with: "
+                "python -c \"import secrets; print(secrets.token_hex(32))\""
+            )
+        secret_key = "dev-key-change-me"
+    app.secret_key = secret_key
 
     # Nothing is written to disk any more: reports are built in memory when
     # asked for, and failed emails are logged to stdout. Serverless hosts give
@@ -34,15 +52,49 @@ def create_app():
     # gracefully - they raised at import time and took every route down with
     # them, kiosk included.
 
-    # Vercel sets VERCEL=1, which is a reliable "am I in production" signal.
     # Secure cookies require HTTPS, so forcing it on would break local http.
     app.config.update(
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
-        SESSION_COOKIE_SECURE=bool(os.environ.get("VERCEL")),
+        SESSION_COOKIE_SECURE=in_production,
+        # A dashboard left open on the office computer shouldn't stay logged in
+        # forever. Twelve hours covers a full day at the center and expires
+        # overnight.
+        PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+        # Safe to cache hard because the URL carries a version stamp (below), so
+        # a restyled page gets a new URL rather than a stale cached file.
+        SEND_FILE_MAX_AGE_DEFAULT=timedelta(days=7),
     )
 
     init_db(app)
+
+    # Every request for the stylesheet otherwise wakes the app up, since the
+    # catch-all rewrite sends static files through it too.
+    app.jinja_env.globals["static_v"] = _static_version()
+    app.jinja_env.globals["csrf_token"] = csrf_token
+
+    # ---------- CSRF ----------
+    # Only the cron endpoint is exempt; it authenticates with a bearer token and
+    # has no session to protect. The kiosk posts its token in a header instead of
+    # a form field, because its requests are JSON sent by JavaScript.
+    csrf_exempt = {"cron_nightly_close"}
+
+    @app.before_request
+    def verify_csrf():
+        if request.method not in ("POST", "PUT", "PATCH", "DELETE"):
+            return None
+        if request.endpoint in csrf_exempt:
+            return None
+        expected = session.get("_csrf", "")
+        supplied = request.form.get("_csrf") or request.headers.get("X-CSRF-Token", "")
+        if not expected or not secrets.compare_digest(supplied, expected):
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "expired", "login_url": url_for("kiosk_login")}), 403
+            # Almost always a form left open until the session expired, so the
+            # message says that rather than accusing the user of an attack.
+            flash("That form expired. Please log in and try again.")
+            return redirect(url_for("login"))
+        return None
 
     # 12-hour time everywhere in the templates — no military time.
     app.add_template_filter(fmt_time, "time12")
@@ -69,20 +121,42 @@ def create_app():
             return None
 
     # ---------- auth helpers ----------
+    # There are two doors, and one key. The kiosk needs unlocking before anyone
+    # can see the student list, and the dashboard needs the password entered
+    # again on top of that - so a tablet left unlocked in the lobby all day is
+    # only ever a check-in screen, never a way into the roster, the parent email
+    # addresses, or the Remove buttons.
     def login_required(view):
         @wraps(view)
         def wrapped(*args, **kwargs):
             if not session.get("instructor_id"):
-                return redirect(url_for("login", next=request.path))
+                return redirect(url_for("login", next=request.full_path.rstrip("?")))
+            return view(*args, **kwargs)
+        return wrapped
+
+    def kiosk_required(view):
+        """Kiosk access. Being logged into the dashboard counts - the instructor
+        has already proved they know the password, so don't ask twice going that
+        direction."""
+        @wraps(view)
+        def wrapped(*args, **kwargs):
+            if not (session.get("kiosk_ok") or session.get("instructor_id")):
+                if request.path.startswith("/api/"):
+                    # The tablet's JavaScript is asking. Hand back something it
+                    # can parse - a login page would arrive as unreadable HTML.
+                    return jsonify({"error": "locked", "login_url": url_for("kiosk_login")}), 401
+                return redirect(url_for("kiosk_login", next=request.path))
             return view(*args, **kwargs)
         return wrapped
 
     # ---------- student kiosk ----------
     @app.route("/")
+    @kiosk_required
     def kiosk():
         return render_template("checkin.html", center_name=os.environ.get("CENTER_NAME", "Kumon"))
 
     @app.get("/api/students")
+    @kiosk_required
     def api_students():
         db = get_db()
         rows = db.execute(
@@ -91,6 +165,7 @@ def create_app():
         return jsonify([{"id": r["id"], "name": r["name"]} for r in rows])
 
     @app.get("/api/students/<int:student_id>/status")
+    @kiosk_required
     def api_student_status(student_id):
         db = get_db()
         open_visit = db.execute(
@@ -108,6 +183,7 @@ def create_app():
         return jsonify({"status": "checked_out"})
 
     @app.post("/api/checkin")
+    @kiosk_required
     def api_checkin():
         student_id = student_id_param()
         db = get_db()
@@ -145,6 +221,7 @@ def create_app():
         })
 
     @app.post("/api/checkout")
+    @kiosk_required
     def api_checkout():
         student_id = student_id_param()
         db = get_db()
@@ -203,10 +280,18 @@ def create_app():
             "email_status": email_status,
         })
 
-    # ---------- instructor auth ----------
-    @app.route("/login", methods=["GET", "POST"])
-    def login():
+    # ---------- auth ----------
+    # Both doors are this one function, rendering this one page. Same look, same
+    # username and password. The only difference is how much a success grants:
+    # the kiosk door unlocks the check-in screen and nothing else, so getting
+    # into the dashboard means typing the password again even from a tablet
+    # that's already unlocked.
+    def _login_page(grants_dashboard: bool, default_next: str, show_kiosk_link: bool):
         if request.method == "POST":
+            if _login_locked_out():
+                flash("Too many failed attempts. Please wait 15 minutes and try again.")
+                return render_template("login.html", show_kiosk_link=show_kiosk_link), 429
+
             username = request.form.get("username", "").strip()
             password = request.form.get("password", "")
             db = get_db()
@@ -214,22 +299,45 @@ def create_app():
                 "SELECT id, password_hash FROM instructors WHERE username = %s", (username,)
             ).fetchone()
             if row and check_password_hash(row["password_hash"], password):
+                _clear_login_attempts()
+                # Cleared and rebuilt so an old session can't be re-used, and so
+                # the CSRF token is reissued along with the new access.
                 session.clear()
-                session["instructor_id"] = row["id"]
-                # Only same-site paths. login_required only ever sets `next` to
-                # a local path, but the URL is user-supplied, so "next=https://
+                session.permanent = True
+                session["kiosk_ok"] = True
+                if grants_dashboard:
+                    session["instructor_id"] = row["id"]
+                # Only same-site paths. The decorators only ever set `next` to a
+                # local path, but the URL is user-supplied, so "next=https://
                 # elsewhere" would otherwise hand a freshly logged-in instructor
-                # to another site. "//host" is a protocol-relative URL, so it
-                # has to be rejected too even though it starts with a slash.
+                # to another site. "//host" is a protocol-relative URL, so it has
+                # to be rejected too even though it starts with a slash.
                 nxt = request.args.get("next") or ""
                 if not nxt.startswith("/") or nxt.startswith("//"):
-                    nxt = url_for("dashboard")
+                    nxt = default_next
                 return redirect(nxt)
+            _record_failed_login()
             flash("Incorrect username or password.")
-        return render_template("login.html")
+        return render_template("login.html", show_kiosk_link=show_kiosk_link)
+
+    @app.route("/kiosk-login", methods=["GET", "POST"])
+    def kiosk_login():
+        """The door onto the check-in screen. Unlocked once in the morning."""
+        # No "Back to check-in" link here - it would point at the page you are
+        # already looking at.
+        return _login_page(grants_dashboard=False, default_next=url_for("kiosk"),
+                           show_kiosk_link=False)
+
+    @app.route("/login", methods=["GET", "POST"])
+    def login():
+        """The door onto the dashboard. Always asks, even from an unlocked kiosk."""
+        return _login_page(grants_dashboard=True, default_next=url_for("dashboard"),
+                           show_kiosk_link=True)
 
     @app.route("/logout")
     def logout():
+        # Drops kiosk access too. Logging out should mean logging out; the
+        # tablet is unlocked again with the same password.
         session.clear()
         return redirect(url_for("login"))
 
@@ -286,7 +394,7 @@ def create_app():
             session_dates=recent_session_dates(),
             students=students,
             student_count=len(students),
-            close_time_display=fmt_time(datetime.combine(date.today(), closing)),
+            close_time_display=fmt_time(datetime.combine(local_today(), closing)),
             report_days_display=_report_days_display(),
         )
 
@@ -414,10 +522,12 @@ def create_app():
     # timer would have been created and destroyed in the same half-second, every
     # request, silently never firing. Vercel Cron calls this URL instead.
     #
-    # Timing is forgiving on purpose: _close_open_visits() stamps the closing
-    # time based on each visit's own check-in date, not on when the job runs, so
-    # a late run (or the hour that daylight saving moves) records the same data.
-    # Re-running is harmless too - the second run finds nothing left open.
+    # Timing is forgiving on purpose. _close_open_visits() stamps the closing
+    # time based on each visit's own check-in date, not on when the job runs, and
+    # the report covers last_session_day() rather than "today", so a late run -
+    # or one that crosses midnight because the cron schedule is in UTC and the
+    # center isn't - still reports on the session that just ended. Re-running is
+    # harmless too: the second run finds nothing left open.
     # GET as well as POST: Vercel Cron invokes the path with a GET request.
     @app.route("/api/cron/nightly-close", methods=["GET", "POST"])
     def cron_nightly_close():
@@ -430,13 +540,13 @@ def create_app():
             return jsonify({"error": "unauthorized"}), 401
 
         closed = _close_open_visits()
-        today = local_today()
-        result = {"closed": closed, "date": today.isoformat(), "report": "skipped"}
+        session_day = last_session_day()
+        result = {"closed": closed, "date": session_day.isoformat(), "report": "skipped"}
 
-        if is_report_day(today):
-            buf = build_report_pdf(today)
+        if is_report_day(session_day):
+            buf = build_report_pdf(session_day)
             result["report"] = send_report_email(
-                buf.getvalue(), f"report_{today.isoformat()}.pdf", today
+                buf.getvalue(), f"report_{session_day.isoformat()}.pdf", session_day
             )
 
         app.logger.info("Nightly close: %s", result)
@@ -446,6 +556,114 @@ def create_app():
 
 
 DEFAULT_SESSION_DATES_SHOWN = 10
+
+# How long a run of failed logins is remembered, and how many are allowed in it.
+LOGIN_WINDOW_MINUTES = 15
+LOGIN_MAX_ATTEMPTS = 10
+
+
+def _static_version() -> str:
+    """A stamp that changes when the stylesheet does, used as a cache buster.
+
+    Lets the stylesheet be cached for a week without the risk of a restyled page
+    serving the old one: editing the file changes its size and timestamp, which
+    changes the URL.
+    """
+    try:
+        stat = os.stat(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "static", "style.css"))
+        return f"{int(stat.st_mtime)}-{stat.st_size}"
+    except OSError:
+        return "1"
+
+
+def csrf_token() -> str:
+    """A per-session token that every form on the site has to send back.
+
+    Without it, another site could quietly post to /dashboard/students/5/deactivate
+    while an instructor is logged in, and the browser would attach their cookie.
+    SameSite=Lax already blocks the usual version of that; this closes the rest.
+    """
+    token = session.get("_csrf")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["_csrf"] = token
+    return token
+
+
+def last_session_day():
+    """The date of the session that has just finished.
+
+    The nightly job is scheduled in UTC, so depending on daylight saving it can
+    run either side of local midnight - and "today" would then mean the day that
+    is only just starting. Anchoring on the closing time instead means the report
+    always covers the session that actually happened, whether the job runs at
+    11 PM or at 1 AM.
+    """
+    now = local_now()
+    if now.time() >= close_time():
+        return now.date()
+    return now.date() - timedelta(days=1)
+
+
+def _client_ip() -> str:
+    """The visitor's address. Behind Vercel's proxy remote_addr is the proxy, so
+    the first entry of X-Forwarded-For is the real client."""
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()[:100]
+    return (request.remote_addr or "unknown")[:100]
+
+
+def _login_window_start() -> str:
+    return (local_now() - timedelta(minutes=LOGIN_WINDOW_MINUTES)).isoformat(timespec="seconds")
+
+
+def _login_locked_out() -> bool:
+    """True once an address has failed too many times recently.
+
+    Fails open if the login_attempts table hasn't been created yet - a login
+    page nobody can use is a worse outcome than an unthrottled one, and the
+    warning below says exactly what to run.
+    """
+    db = get_db()
+    try:
+        row = db.execute(
+            "SELECT count(*) AS n FROM login_attempts WHERE ip = %s AND attempted_at > %s",
+            (_client_ip(), _login_window_start()),
+        ).fetchone()
+    except psycopg.errors.UndefinedTable:
+        db.rollback()
+        print("[login] WARNING: no login_attempts table, so failed logins are not "
+              "being throttled. Run: python setup_db.py", flush=True)
+        return False
+    return row["n"] >= LOGIN_MAX_ATTEMPTS
+
+
+def _record_failed_login():
+    db = get_db()
+    try:
+        db.execute(
+            "INSERT INTO login_attempts (ip, attempted_at) VALUES (%s, %s)",
+            (_client_ip(), local_now().isoformat(timespec="seconds")),
+        )
+        # Cheap housekeeping: rows older than the window can never matter again,
+        # and pruning here means the table needs no separate cleanup job.
+        db.execute("DELETE FROM login_attempts WHERE attempted_at < %s", (_login_window_start(),))
+        db.commit()
+    except psycopg.errors.UndefinedTable:
+        db.rollback()
+
+
+def _clear_login_attempts():
+    """A correct password wipes the slate, so a few typos don't lock out the
+    instructor for the rest of the window."""
+    db = get_db()
+    try:
+        db.execute("DELETE FROM login_attempts WHERE ip = %s", (_client_ip(),))
+        db.commit()
+    except psycopg.errors.UndefinedTable:
+        db.rollback()
 
 
 def recent_session_dates(count=DEFAULT_SESSION_DATES_SHOWN):

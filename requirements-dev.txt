@@ -1,0 +1,9 @@
+# Everything the deployed app needs, plus the tools that only ever run on your
+# own machine. Neither of the extras is used on Vercel, so keeping them out of
+# requirements.txt keeps the deployed function smaller and quicker to start.
+-r requirements.txt
+
+# Reading the roster export in import_students.py.
+openpyxl==3.1.5
+# Serving the app locally on your own network (see "Running it for real").
+gunicorn==22.0.0

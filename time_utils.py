@@ -18,14 +18,28 @@ DEFAULT_REPORT_DAYS = "mon,thu"
 _WEEKDAY_ABBR = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
 
+_tz_warned = False
+
+
 def get_timezone():
     """The center's timezone from REPORT_TIMEZONE, or None to use system local time."""
+    global _tz_warned
     name = (os.environ.get("REPORT_TIMEZONE") or "").strip()
     if not name:
         return None
     try:
         return ZoneInfo(name)
     except (ZoneInfoNotFoundError, ValueError):
+        # Falling back silently is the dangerous case: the app keeps working and
+        # every timestamp is quietly hours off, which looks identical to a
+        # correct deployment until someone reads a check-in time. Say so loudly.
+        # The `tzdata` package in requirements.txt is what normally prevents it -
+        # the Vercel image has no system timezone database of its own.
+        if not _tz_warned:
+            _tz_warned = True
+            print(f"[timezone] WARNING: REPORT_TIMEZONE={name!r} could not be loaded. "
+                  f"Falling back to the server clock, which is UTC on most hosts, so "
+                  f"times will be wrong. Check that 'tzdata' is installed.", flush=True)
         return None
 
 

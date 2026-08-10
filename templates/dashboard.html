@@ -72,6 +72,7 @@
   <section class="dash-students">
     <h2>Manage Students</h2>
     <form method="post" action="{{ url_for('add_student') }}" class="add-student-form">
+      <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
       <input type="text" name="name" placeholder="Student name" required>
       <input type="email" name="email" placeholder="Parent email, e.g. parent@example.com" required>
       <button type="submit" class="big-btn small">Add Student</button>
@@ -92,12 +93,14 @@
           <div class="student-row-actions">
             <form method="post" action="{{ url_for('update_student_email', student_id=s.id) }}"
                   class="update-email-form">
+              <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
               <input type="email" name="email" placeholder="New parent email"
                      aria-label="New email for {{ s.name }}" required>
               <button type="submit" class="link-btn">Save</button>
             </form>
             <form method="post" action="{{ url_for('deactivate_student', student_id=s.id) }}"
                   onsubmit="return confirm('Remove {{ s.name }} from the check-in list?');">
+              <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
               <button type="submit" class="link-btn danger">Remove</button>
             </form>
           </div>

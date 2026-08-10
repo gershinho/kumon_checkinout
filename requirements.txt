@@ -2,6 +2,8 @@ Flask==3.0.3
 psycopg[binary]==3.3.4
 cryptography==42.0.8
 reportlab==4.2.2
-openpyxl==3.1.5
 python-dotenv==1.0.1
-gunicorn==22.0.0
+# Ships the IANA timezone database with the app. Without it, ZoneInfo falls back
+# to the host's system files, which the Vercel Python image does not reliably
+# have - and REPORT_TIMEZONE would silently degrade to UTC.
+tzdata==2025.2

@@ -42,13 +42,22 @@ def _smtp_settings():
     }
 
 
+# Comfortably under the host's own limit on how long a request may run (30s, set
+# in vercel.json). The check-out email is sent inside the student's request, so
+# an SMTP timeout longer than that would take the whole request down with it -
+# the visit is already recorded as checked out by then, but the student would
+# see "couldn't reach the check-in system" for something that actually worked.
+SMTP_TIMEOUT_SECONDS = 10
+
+
 def _send(message, recipients, cfg):
     """Deliver one message per recipient over SMTP."""
     context = ssl.create_default_context()
     if cfg["port"] == 465:
-        server = smtplib.SMTP_SSL(cfg["host"], cfg["port"], timeout=20, context=context)
+        server = smtplib.SMTP_SSL(cfg["host"], cfg["port"],
+                                  timeout=SMTP_TIMEOUT_SECONDS, context=context)
     else:
-        server = smtplib.SMTP(cfg["host"], cfg["port"], timeout=20)
+        server = smtplib.SMTP(cfg["host"], cfg["port"], timeout=SMTP_TIMEOUT_SECONDS)
     with server:
         if cfg["port"] != 465:
             server.starttls(context=context)

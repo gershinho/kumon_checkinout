@@ -7,9 +7,11 @@ daily PDF report.
 
 ## What it does
 
-- **Student kiosk** (`/`) — big buttons, no login needed. Tapping the name box
-  drops down the student list; it filters as the student types, and they tap
-  their name, then **Check In** or **Check Out**.
+- **Student kiosk** (`/`) — big buttons, and students don't log in. The tablet
+  itself is unlocked once by the instructor at the start of a session and stays
+  unlocked all day. Tapping the name box drops down the student list; it filters
+  as the student types, and they tap their name, then **Check In** or
+  **Check Out**.
 - **Instant parent email** — the moment a student checks out, an email goes to the
   parent address on file ("Kumon: Aadhya checked out at 4:32 PM").
 - **Instructor dashboard** (`/login` → `/dashboard`) — password protected. Shows
@@ -32,6 +34,16 @@ daily PDF report.
 
 ## Security & privacy
 
+- **Two doors, one key.** Nothing is visible to the public — not the check-in
+  screen, not the student list behind it. Both the kiosk and the dashboard are
+  opened with the same username and password, on the same login page, but they
+  are unlocked separately: signing in at the kiosk unlocks *only* the check-in
+  screen. Getting into the dashboard means entering the password again, even on
+  a tablet that's already unlocked. So a tablet sitting in the lobby all session
+  is only ever a check-in screen — a curious student who types in the dashboard
+  address is asked for the password, same as anyone on the internet.
+- Unlocking lasts twelve hours of inactivity and refreshes with use, so the
+  tablet is unlocked once per session rather than once per student.
 - Parent email addresses are **encrypted at rest** (Fernet/AES) using a key you
   control (`EMAIL_ENCRYPTION_KEY`). They are only decrypted in memory, right when
   an email needs to be sent or shown (masked) on the dashboard.
@@ -39,6 +51,13 @@ daily PDF report.
 - Each parent gets their own message; addresses are never exposed to each other.
 - The instructor password is stored as a salted hash, never in plain text, and
   exactly one instructor account exists at a time - the one in `.env`.
+- Repeated wrong passwords are throttled: ten failures from the same address
+  within fifteen minutes and that address is locked out for the rest of the
+  window, so the login page can't be guessed at from a public URL. A correct
+  password clears the count.
+- A dashboard session expires after twelve hours, and every form on the site
+  carries a one-time token, so another site can't post to the dashboard using a
+  logged-in instructor's browser.
 - Student records live in a Postgres database (Supabase), reachable only with
   the `DATABASE_URL` password in `.env`. Because addresses are encrypted before
   they are written, they stay unreadable in the database itself - the
@@ -54,7 +73,7 @@ daily PDF report.
 ```bash
 python3 -m venv venv
 source venv/bin/activate          # on Windows: venv\Scripts\activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 
 cp .env.example .env
 ```
@@ -72,11 +91,12 @@ Now edit `.env`:
    python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
    ```
 3. **INSTRUCTOR_USERNAME / INSTRUCTOR_PASSWORD** — your dashboard login. `.env`
-   is the single source of truth: every time the app starts it makes the
-   database match these values. Change the password here and restart, and the
-   old one stops working immediately. Any other instructor account is removed,
-   so there's only ever one way in. (If both are left blank, the existing
-   account is left untouched rather than locking you out.)
+   is the single source of truth, applied by `python setup_db.py`: change the
+   password here, re-run that command, and the old one stops working
+   immediately. Any other instructor account is removed, so there's only ever
+   one way in. (If both are left blank, the existing account is left untouched
+   rather than locking you out.) Pick a long one — this is the only thing
+   standing between the internet and the dashboard.
 4. **DATABASE_URL** — in Supabase, click **Connect** → **Direct connection
    string** → **Transaction pooler**. It must be the *pooler* string (host
    contains `pooler.supabase.com`, port `6543`), not the direct one on `5432`.
@@ -87,8 +107,9 @@ Now edit `.env`:
    address parents will see the notification come from. For Gmail, use
    `smtp.gmail.com` port `587` with an **App Password** (Google blocks your
    normal password for SMTP). Until this is filled in, checkouts still work —
-   messages are written to `data/email_log.txt` instead of being sent, so you
-   can test the whole flow first.
+   the dashboard marks them "Not configured" and a line is written to the
+   server log instead of an email being sent, so you can test the whole flow
+   first. Parent addresses are never written to the log.
 
 ## Create the tables
 
@@ -99,9 +120,14 @@ python setup_db.py
 ```
 
 This creates the tables and your instructor login. **Re-run it any time you
-change `INSTRUCTOR_USERNAME` or `INSTRUCTOR_PASSWORD` in `.env`** — that sync
-used to happen every time the app started, which stops being reasonable once a
-host restarts the app hundreds of times a day.
+change `INSTRUCTOR_USERNAME` or `INSTRUCTOR_PASSWORD` in `.env`**, and any time
+this project adds a table — that sync used to happen every time the app started,
+which stops being reasonable once a host restarts the app hundreds of times a
+day. It's safe to run as often as you like; existing data is left alone.
+
+To point it at your deployed database rather than a local one, put the
+production `DATABASE_URL` in `.env` and run it from your own machine — the app
+never creates tables by itself.
 
 Coming from the old SQLite version? Copy your existing roster across with:
 
@@ -135,6 +161,7 @@ existing students and adds new ones without duplicating anyone.
 python app.py
 ```
 
+That's the development server — fine for trying things out on your own machine.
 Visit `http://localhost:5000/` for the student kiosk on your tablet, and
 `http://localhost:5000/login` for the instructor dashboard.
 
@@ -155,25 +182,50 @@ hitting `/api/cron/nightly-close` with the `CRON_SECRET` header.
 
 ## Deploying to Vercel
 
-`vercel.json` and `api/index.py` are already set up. Push the repo to GitHub,
-import it in Vercel, and set **every variable from your `.env`** in Project
-Settings → Environment Variables — especially `DATABASE_URL`,
-`EMAIL_ENCRYPTION_KEY`, `SECRET_KEY`, and the `INSTRUCTOR_*` pair.
+`vercel.json`, `.python-version`, and `api/index.py` are already set up. Push the
+repo to GitHub, import it in Vercel, and set **every variable from your `.env`**
+in Project Settings → Environment Variables — especially `DATABASE_URL`,
+`EMAIL_ENCRYPTION_KEY`, `SECRET_KEY`, `REPORT_TIMEZONE`, and the `INSTRUCTOR_*`
+pair. Then run `python setup_db.py` once from your own machine, pointed at the
+production `DATABASE_URL`, to create the tables.
+
+`SECRET_KEY` is not optional in production: without it the app refuses to start
+rather than fall back to a placeholder that anyone reading this repository could
+use to forge an instructor session.
 
 The cron entry in `vercel.json` calls `/api/cron/nightly-close` daily at
-`05:00 UTC` (midnight Central in summer, 11 PM in winter — comfortably after the
-center closes). Vercel provides `CRON_SECRET` automatically; the endpoint
-refuses any request without it.
+`05:00 UTC` — midnight Central in summer, 11 PM in winter. Vercel provides
+`CRON_SECRET` automatically; the endpoint refuses any request without it.
 
-Running late doesn't matter: visits are stamped with the closing time from their
-own check-in date, not from when the job runs, so daylight saving can't change
-the recorded data. Running twice doesn't matter either — the second run finds
-nothing open.
+An hour earlier would also land after the 10 PM close, but in winter it would
+land *exactly* on it, and "which session just ended" is decided by comparing
+against closing time — so a couple of seconds of clock skew either way would
+attribute the night to the wrong day. `05:00` keeps an hour of clearance in both
+directions, in both seasons, even on a Hobby plan where a job can start up to an
+hour late.
 
-**Before you go live:** the kiosk at `/` and the roster at `/api/students` have
-no login, which is correct on a private network but not on a public URL — anyone
-with the address would see every student's name and be able to check them out.
-Turn on Vercel's **Deployment Protection**, or add a kiosk password, first.
+Running late doesn't matter. Visits are stamped with the closing time from their
+own check-in date, not from when the job runs, and the report covers the session
+that has just finished rather than whatever "today" happens to be when the job
+fires — so a run that slips past local midnight still reports on the right day.
+Running twice doesn't matter either: the second run finds nothing open.
+
+Two things worth knowing about the Vercel environment specifically:
+
+- Its Python image has no timezone database of its own, so `tzdata` is listed in
+  `requirements.txt`. Without it `REPORT_TIMEZONE` would silently do nothing and
+  every time would be recorded in UTC. If that ever happens the server log says
+  so explicitly.
+- `vercel.json` allows each request 30 seconds; the check-out email gives up
+  after 10. The email is sent while the student waits, so the mail server has to
+  be the thing that gives up first — otherwise a slow send would fail the whole
+  request for a check-out that actually worked.
+
+**On the tablet:** browse to the site once at the start of a session, enter the
+instructor username and password, and leave it on the check-in screen. Students
+tap their own names from there; they never see a password prompt. If the tablet
+has been idle long enough for the session to lapse, it returns to the login page
+by itself rather than showing an error.
 
 ## Changing the schedule
 
@@ -196,18 +248,21 @@ never carries over. Only the emailed report is limited to `REPORT_DAYS`.
 ## Project layout
 
 ```
-app.py               Flask routes (kiosk, dashboard, API, nightly cron endpoint)
-db.py                 Postgres schema + connection handling
-setup_db.py            One-time setup: create tables, instructor login, migration
-api/index.py            Vercel entry point (imports app.py)
-vercel.json              Vercel routing + nightly cron schedule
-time_utils.py          Timezone, 12-hour formatting, closing time, report days
-crypto_utils.py         Email address encryption/decryption
-email_utils.py           Check-out email sending (with safe log fallback)
-pdf_report.py            Daily PDF report generation
-import_students.py        Roster importer (reads name + parent email only)
-templates/                  checkin.html, login.html, dashboard.html
-static/style.css              Kumon-blue styling
-                               (nothing is written to disk — reports are built
-                               in memory, failed emails are logged to stdout)
+app.py                  Flask routes (kiosk, dashboard, API, nightly cron endpoint)
+db.py                    Postgres schema + connection handling
+setup_db.py               One-time setup: create tables, instructor login, migration
+api/index.py               Vercel entry point (imports app.py)
+vercel.json                 Vercel routing, request time limit, nightly cron schedule
+.python-version              Python version Vercel builds with
+requirements.txt              What the deployed app needs
+requirements-dev.txt           ...plus the tools that only run on your own machine
+time_utils.py                Timezone, 12-hour formatting, closing time, report days
+crypto_utils.py               Email address encryption/decryption
+email_utils.py                 Check-out email sending (with safe log fallback)
+pdf_report.py                  Daily PDF report generation
+import_students.py              Roster importer (reads name + parent email only)
+templates/                        checkin.html, login.html, dashboard.html
+static/style.css                    Kumon-blue styling
+                                     (nothing is written to disk — reports are built
+                                     in memory, failed emails are logged to stdout)
 ```

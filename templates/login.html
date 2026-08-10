@@ -6,6 +6,7 @@
   <div class="login-card">
     <h1>Instructor Login</h1>
     <form method="post">
+      <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
       <label for="username">Username</label>
       <input type="text" id="username" name="username" autocomplete="username" required autofocus>
 
@@ -14,7 +15,9 @@
 
       <button type="submit" class="big-btn">Log In</button>
     </form>
+    {% if show_kiosk_link|default(true) %}
     <a class="link-btn" href="{{ url_for('kiosk') }}">Back to check-in</a>
+    {% endif %}
   </div>
 </div>
 {% endblock %}

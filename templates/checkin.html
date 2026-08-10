@@ -39,6 +39,8 @@
 </div>
 
 <script>
+const CSRF_TOKEN = {{ csrf_token()|tojson }};
+
 let allStudents = [];
 let selectedStudent = null;
 let suggestions = [];      // students currently shown in the dropdown
@@ -48,8 +50,21 @@ const searchEl = document.getElementById('search');
 const resultsEl = document.getElementById('results');
 const hintEl = document.getElementById('hint');
 
+/* The kiosk unlocks for the day, but the session does eventually expire. When
+   that happens the server answers with a lock code instead of data, and the
+   tablet sends itself back to the login page rather than sitting there looking
+   broken or trying to read a login page as if it were a student list. */
+function isLocked(res) {
+  return res.status === 401 || res.status === 403;
+}
+
+function goToLogin() {
+  window.location.href = '/kiosk-login';
+}
+
 async function loadStudents() {
   const res = await fetch('/api/students');
+  if (isLocked(res)) { goToLogin(); return; }
   allStudents = await res.json();
   if (allStudents.length === 0) {
     hintEl.textContent = 'No students on the list yet — ask your instructor to add you.';
@@ -172,6 +187,7 @@ async function selectStudent(student) {
   document.getElementById('action-name').textContent = student.name;
 
   const statusRes = await fetch(`/api/students/${student.id}/status`);
+  if (isLocked(statusRes)) { goToLogin(); return; }
   const status = await statusRes.json();
   const statusEl = document.getElementById('action-status');
   const checkinBtn = document.getElementById('btn-checkin');
@@ -227,9 +243,10 @@ async function doAction(endpoint, button) {
   try {
     const res = await fetch(endpoint, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN },
       body: JSON.stringify({ student_id: student.id }),
     });
+    if (isLocked(res)) { goToLogin(); return; }
     const data = await res.json();
     showToast(data.message || data.error, !res.ok);
     resetPanel();

@@ -71,12 +71,17 @@ CREATE TABLE IF NOT EXISTS instructors (
     password_hash  TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS reports (
+-- Failed instructor logins, so a public URL can't be brute-forced. A table
+-- rather than a counter in memory: each request may run in a different
+-- serverless instance, so anything held in process memory is forgotten between
+-- attempts and would count every try as the first.
+CREATE TABLE IF NOT EXISTS login_attempts (
     id            SERIAL PRIMARY KEY,
-    report_date   TEXT NOT NULL UNIQUE,
-    filename      TEXT NOT NULL,
-    generated_at  TEXT NOT NULL
+    ip            TEXT NOT NULL,
+    attempted_at  TEXT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_login_attempts ON login_attempts(ip, attempted_at);
 
 CREATE INDEX IF NOT EXISTS idx_visits_student ON visits(student_id);
 CREATE INDEX IF NOT EXISTS idx_visits_checkin ON visits(check_in_time);

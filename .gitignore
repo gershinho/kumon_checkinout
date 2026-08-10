@@ -1,5 +1,22 @@
+# Secrets. Everything real lives here; only .env.example is shared.
 .env
+.env.*
+!.env.example
+
+# Student data. The roster export from the school software carries names,
+# parent emails, addresses and dates of birth - none of it belongs in a
+# repository, least of all a public one. The importer reads it from wherever
+# you keep it, so there is no reason for it to be committed.
 data/
+*.xlsx
+*.xls
+*.csv
+*.db
+*.sqlite
+*.sqlite3
+
+# Local tooling
 venv/
 __pycache__/
 *.pyc
+.vercel/

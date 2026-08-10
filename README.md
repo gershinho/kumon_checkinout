@@ -182,7 +182,14 @@ hitting `/api/cron/nightly-close` with the `CRON_SECRET` header.
 
 ## Deploying to Vercel
 
-`vercel.json`, `.python-version`, and `api/index.py` are already set up. Push the
+Vercel detects Flask on its own: it looks for a `Flask` instance named `app` at
+a known entrypoint, and `app.py` in the project root is one. Everything then
+routes to it, original URL intact — so there is no routing to configure and
+**no `rewrites` block**. An earlier version of this file had one, pointing at an
+`api/index.py` shim; it sent every request to the app with `/api/index` as the
+path, so the app answered 404 to every URL including its own home page.
+
+`vercel.json` and `.python-version` are already set up. Push the
 repo to GitHub, import it in Vercel, and set every variable from your `.env` in
 Project Settings → Environment Variables **except `INSTRUCTOR_USERNAME` and
 `INSTRUCTOR_PASSWORD`** — the running app never reads those two. They are only
@@ -253,11 +260,10 @@ never carries over. Only the emailed report is limited to `REPORT_DAYS`.
 ## Project layout
 
 ```
-app.py                  Flask routes (kiosk, dashboard, API, nightly cron endpoint)
+app.py                  Flask routes, and the entrypoint Vercel looks for
 db.py                    Postgres schema + connection handling
 setup_db.py               One-time setup: create tables, instructor login, migration
-api/index.py               Vercel entry point (imports app.py)
-vercel.json                 Vercel routing, request time limit, nightly cron schedule
+vercel.json                 Request time limit + nightly cron schedule
 .python-version              Python version Vercel builds with
 requirements.txt              What the deployed app needs
 requirements-dev.txt           ...plus the tools that only run on your own machine

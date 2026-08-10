@@ -1,9 +1,7 @@
 {
-  "rewrites": [
-    { "source": "/(.*)", "destination": "/api/index" }
-  ],
+  "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
-    "api/index.py": { "maxDuration": 30 }
+    "app.py": { "maxDuration": 30 }
   },
   "crons": [
     { "path": "/api/cron/nightly-close", "schedule": "0 5 * * *" }

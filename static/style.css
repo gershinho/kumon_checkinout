@@ -167,6 +167,13 @@ body.kiosk { background: var(--kumon-blue-light); }
   text-decoration: underline;
 }
 
+.report-actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.report-actions form { display: inline; }
+
 .toast {
   position: fixed;
   bottom: 24px;
@@ -184,6 +191,19 @@ body.kiosk { background: var(--kumon-blue-light); }
 .toast.hidden { display: none; }
 .toast-success { background: var(--ok-green); }
 .toast-error { background: var(--bad-red); }
+/* Checked out, but the parent wasn't emailed. Not a failure the student caused
+   and not a success either - amber, and it stays up long enough to be read and
+   acted on rather than sliding away like the routine confirmations. */
+.toast-warn {
+  background: #B26A00;
+  border: 3px solid #FFD79A;
+}
+.toast-warn .toast-followup {
+  display: block;
+  margin-top: 6px;
+  font-size: 0.95rem;
+  font-weight: 500;
+}
 
 .kiosk-footer { text-align: center; margin-top: auto; padding-top: 24px; }
 .kiosk-footer a { color: var(--muted); font-size: 0.9rem; }

@@ -276,16 +276,24 @@ def create_app():
         )
         db.commit()
 
-        note = ""
-        if email_status == "not_configured":
-            note = " (Email isn't set up yet — see the instructor dashboard.)"
-        elif email_status == "failed":
-            note = " (We couldn't send the email — the instructor has been notified.)"
-        elif email_status == "no_address":
-            note = " (No parent email on file — please tell your instructor.)"
+        # The check-out itself succeeded either way - the visit is recorded and
+        # the student is free to leave. What may have failed is telling their
+        # parent, and only a person can fix that, so say so plainly instead of
+        # burying it in a green tick. The old copy claimed "the instructor has
+        # been notified", which was not true of anything the code did.
+        problems = {
+            "failed": "We could not email your parent. Please tell your instructor before you leave.",
+            "not_configured": "Parent emails aren't switched on yet, so nobody was emailed. "
+                              "Please tell your instructor.",
+            "no_address": "We don't have a parent email on file for you, so nobody was emailed. "
+                          "Please tell your instructor.",
+        }
+        problem = problems.get(email_status)
 
         return jsonify({
-            "message": f"{student['name']} checked out at {fmt_time(now)}!{note}",
+            "message": f"{student['name']} checked out at {fmt_time(now)}.",
+            "email_ok": email_status == "sent",
+            "problem": problem,
             "time": now_iso,
             "time_display": fmt_time(now),
             "email_status": email_status,
@@ -528,6 +536,41 @@ def create_app():
             as_attachment=True,
             download_name=f"report_{day.isoformat()}.pdf",
         )
+
+    @app.post("/dashboard/reports/<report_date>/email")
+    @login_required
+    def email_report(report_date):
+        """Email a report on demand, to the address the nightly job uses.
+
+        Two jobs. It's the safe way to prove the report email works end to end -
+        it goes to the instructor, never to a parent - and it covers the nights
+        the automatic one deliberately stays quiet: a day with three or fewer
+        check-ins, or any day that isn't a session day. Asking for it by hand is
+        explicit, so no threshold is applied.
+        """
+        try:
+            day = date.fromisoformat(report_date)
+        except ValueError:
+            flash("That isn't a valid date.")
+            return redirect(url_for("dashboard"))
+        if day > local_today():
+            flash("That date hasn't happened yet.")
+            return redirect(url_for("dashboard"))
+
+        destination = (os.environ.get("REPORT_EMAIL") or "").strip()
+        if not destination:
+            flash("No report address is set (REPORT_EMAIL), so there's nowhere to send it.")
+            return redirect(url_for("dashboard"))
+
+        buf = build_report_pdf(day)
+        status = send_report_email(buf.getvalue(), f"report_{day.isoformat()}.pdf", day)
+        if status == "sent":
+            flash(f"Report for {fmt_date(day)} emailed to {mask_email(destination)}.")
+        elif status == "not_configured":
+            flash("Email isn't set up, so the report couldn't be sent.")
+        else:
+            flash("Couldn't send the report — check the email settings and try again.")
+        return redirect(url_for("dashboard"))
 
     # ---------- nightly close-out, triggered by the host's scheduler ----------
     # The center runs 2 PM - 10 PM on Mondays and Thursdays. Every night after

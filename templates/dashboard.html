@@ -129,7 +129,13 @@
       {% for d in session_dates %}
       <li>
         <span>{{ d|datelong }}</span>
-        <a href="{{ url_for('download_report', report_date=d.isoformat()) }}">Download PDF</a>
+        <span class="report-actions">
+          <a href="{{ url_for('download_report', report_date=d.isoformat()) }}">Download PDF</a>
+          <form method="post" action="{{ url_for('email_report', report_date=d.isoformat()) }}">
+            <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+            <button type="submit" class="link-btn">Email it to me</button>
+          </form>
+        </span>
       </li>
       {% endfor %}
     </ul>

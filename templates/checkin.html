@@ -217,13 +217,31 @@ function resetPanel() {
   searchEl.focus();
 }
 
-function showToast(message, isError) {
+let toastTimer = null;
+
+/* kind: 'success' | 'error' | 'warn'. A warning means the check-out worked but
+   the parent wasn't emailed - the student has to pass that on to the
+   instructor, so it stays up far longer than a routine confirmation and can be
+   dismissed by tapping it. */
+function showToast(message, kind, followup) {
   const toast = document.getElementById('toast');
-  toast.textContent = message;
-  toast.classList.remove('hidden', 'toast-error', 'toast-success');
-  toast.classList.add(isError ? 'toast-error' : 'toast-success');
-  setTimeout(() => toast.classList.add('hidden'), 4000);
+  toast.textContent = '';
+  toast.appendChild(document.createTextNode(message));
+  if (followup) {
+    const extra = document.createElement('span');
+    extra.className = 'toast-followup';
+    extra.textContent = followup;
+    toast.appendChild(extra);
+  }
+  toast.classList.remove('hidden', 'toast-error', 'toast-success', 'toast-warn');
+  toast.classList.add('toast-' + kind);
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toast.classList.add('hidden'), kind === 'warn' ? 15000 : 4000);
 }
+
+document.getElementById('toast').addEventListener('click', function () {
+  this.classList.add('hidden');
+});
 
 let actionInFlight = false;
 
@@ -265,12 +283,19 @@ async function doAction(endpoint, button) {
       loadStudents();
     }
 
-    showToast(data.message || data.error, !res.ok);
+    if (!res.ok) {
+      showToast(data.error || 'Something went wrong. Please tell your instructor.', 'error');
+    } else if (data.problem) {
+      // Checked out fine, but their parent was not emailed.
+      showToast(data.message, 'warn', data.problem);
+    } else {
+      showToast(data.message, 'success');
+    }
     resetPanel();
   } catch (err) {
     // Network dropped or the server is down - say so instead of hanging on
     // "One moment…" forever with no way back.
-    showToast("Couldn't reach the check-in system. Please tell your instructor.", true);
+    showToast("Couldn't reach the check-in system. Please tell your instructor.", 'error');
     resetPanel();
   } finally {
     button.textContent = originalLabel;

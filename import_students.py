@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from app import create_app  # noqa: E402
 from db import get_db  # noqa: E402
 from crypto_utils import encrypt_email, normalize_email  # noqa: E402
+from student_codes import backfill_codes, with_new_code  # noqa: E402
 
 load_dotenv()
 
@@ -67,7 +68,7 @@ def main():
     ws = wb.active
     headers = [cell.value for cell in ws[1]]
 
-    imported, skipped_no_email, skipped_no_name = 0, 0, 0
+    imported, skipped_no_email, skipped_no_name, new_codes = 0, 0, 0, 0
     source_counts = {}
     seen_names = set()
 
@@ -103,10 +104,18 @@ def main():
                     (enc, existing["id"]),
                 )
             else:
-                db.execute(
-                    "INSERT INTO students (name, email_enc, active) VALUES (%s, %s, 1)",
-                    (name, enc),
+                # New students need a kiosk code; existing ones keep theirs, so
+                # re-running an import never changes a code a family has
+                # already been given.
+                with_new_code(
+                    db,
+                    lambda code, name=name, enc=enc: db.execute(
+                        "INSERT INTO students (name, email_enc, active, code) "
+                        "VALUES (%s, %s, 1, %s)",
+                        (name, enc, code),
+                    ),
                 )
+                new_codes += 1
             imported += 1
 
         if not args.dry_run:
@@ -118,8 +127,15 @@ def main():
                     (list(seen_names),),
                 )
             db.commit()
+            # Catches students imported before codes existed. A no-op once
+            # everyone has one.
+            backfilled = backfill_codes(db)
+            new_codes += backfilled
 
     print(f"\n{'Would import' if args.dry_run else 'Imported'}: {imported}")
+    if new_codes:
+        print(f"New 4-digit codes assigned: {new_codes} "
+              f"(see them on the dashboard under 'Show student codes')")
     print(f"Skipped (no name): {skipped_no_name}")
     print(f"Skipped (no usable email address): {skipped_no_email}")
     if source_counts:

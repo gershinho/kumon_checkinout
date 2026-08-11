@@ -54,15 +54,29 @@ CREATE TABLE IF NOT EXISTS students (
     id          SERIAL PRIMARY KEY,
     name        TEXT NOT NULL,
     email_enc   BYTEA NOT NULL,
-    active      INTEGER NOT NULL DEFAULT 1
+    active      INTEGER NOT NULL DEFAULT 1,
+    -- The 4-digit code the student types at the kiosk. TEXT rather than a
+    -- number so "0042" keeps its leading zeros - as an integer it would come
+    -- back as 42 and never match what is printed on the instructor's list.
+    code        TEXT
 );
 
+-- A visit now has three stamps, not two: the parent checks the student in, the
+-- student says when their work is done (which is what emails the parent), and
+-- the parent checks them out on collection. A visit is "open" until
+-- check_out_time is set, exactly as before.
 CREATE TABLE IF NOT EXISTS visits (
     id              SERIAL PRIMARY KEY,
     student_id      INTEGER NOT NULL REFERENCES students(id),
     check_in_time   TEXT NOT NULL,
+    work_done_time  TEXT,
     check_out_time  TEXT,
-    email_status    TEXT
+    email_status    TEXT,
+    -- Set when the nightly job closed this visit because nobody did. Its own
+    -- column because email_status can no longer carry it: the email is sent at
+    -- "done with work", so a student can be emailed about *and* forgotten
+    -- about, and both facts have to survive.
+    auto_closed     INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS instructors (
@@ -83,6 +97,17 @@ CREATE TABLE IF NOT EXISTS login_attempts (
 
 CREATE INDEX IF NOT EXISTS idx_login_attempts ON login_attempts(ip, attempted_at);
 
+-- Wrong 4-digit codes, throttled the same way and for the same reason. Four
+-- digits is ten thousand guesses, which a bored sibling can work through in an
+-- afternoon; five wrong tries in fifteen minutes stops that being worth doing.
+CREATE TABLE IF NOT EXISTS code_attempts (
+    id            SERIAL PRIMARY KEY,
+    student_id    INTEGER NOT NULL REFERENCES students(id),
+    attempted_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_code_attempts ON code_attempts(student_id, attempted_at);
+
 CREATE INDEX IF NOT EXISTS idx_visits_student ON visits(student_id);
 CREATE INDEX IF NOT EXISTS idx_visits_checkin ON visits(check_in_time);
 
@@ -95,6 +120,36 @@ CREATE INDEX IF NOT EXISTS idx_visits_checkin ON visits(check_in_time);
 -- api_checkin turns that failure into the same "already checked in" message.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_visits_one_open
     ON visits(student_id) WHERE check_out_time IS NULL;
+"""
+
+
+# Changes to tables that already exist. SCHEMA above only ever runs CREATE TABLE
+# IF NOT EXISTS, which is a no-op on a database that already has the table - so
+# it will happily leave an old `students` table without its `code` column and
+# report success. This block is what actually brings an existing deployment
+# forward, and every statement in it is written to be safe to run again.
+#
+# Runs after SCHEMA, so on a brand-new database the columns are already there
+# and every ALTER here is a no-op.
+MIGRATIONS = """
+ALTER TABLE students ADD COLUMN IF NOT EXISTS code TEXT;
+
+ALTER TABLE visits ADD COLUMN IF NOT EXISTS work_done_time TEXT;
+ALTER TABLE visits ADD COLUMN IF NOT EXISTS auto_closed INTEGER NOT NULL DEFAULT 0;
+
+-- "Forgot to check out" used to be recorded by writing 'auto_closed' into
+-- email_status, which conflated two unrelated things. Move the old rows onto
+-- the new column and give email_status back its one job. Matching on the old
+-- value makes this self-limiting: after the first run nothing matches.
+UPDATE visits SET auto_closed = 1, email_status = NULL WHERE email_status = 'auto_closed';
+
+-- Created here rather than in SCHEMA because the column it indexes may have
+-- only just been added by the ALTER above.
+--
+-- Postgres allows any number of NULLs in a unique index, which is what makes
+-- the backfill possible: existing students start with no code, all of them
+-- "distinct" from each other, and get filled in one at a time.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_students_code ON students(code);
 """
 
 
@@ -133,10 +188,22 @@ BEGIN
     END LOOP;
 END $$;
 
-ALTER TABLE students      ENABLE ROW LEVEL SECURITY;
-ALTER TABLE visits        ENABLE ROW LEVEL SECURITY;
-ALTER TABLE instructors   ENABLE ROW LEVEL SECURITY;
-ALTER TABLE login_attempts ENABLE ROW LEVEL SECURITY;
+-- Every table in the schema, found rather than listed.
+--
+-- This used to be a hand-written list, which meant the second layer of defence
+-- silently didn't cover whatever was added last. It had already drifted: the
+-- legacy `reports` table, left over from when PDFs were stored on disk, had RLS
+-- switched off in production. Enumerating pg_tables means the next table added
+-- to SCHEMA is covered the first time setup_db.py runs, without anyone
+-- remembering to come back here.
+DO $$
+DECLARE
+    t text;
+BEGIN
+    FOR t IN SELECT tablename FROM pg_tables WHERE schemaname = 'public' LOOP
+        EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', t);
+    END LOOP;
+END $$;
 """
 
 

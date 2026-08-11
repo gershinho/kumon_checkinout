@@ -1,34 +1,61 @@
 # Kumon Check-In / Check-Out System
 
-A simple, self-hosted Flask app for a Kumon center: students tap their name on a
-tablet/kiosk to check in and check out, parents get an email the instant a
-child checks out, and the instructor gets a private dashboard plus an automatic
-daily PDF report.
+A simple, self-hosted Flask app for a Kumon center: a tablet in the lobby records
+a student arriving, finishing their work, and being collected. The parent is
+emailed the moment the work is done, so they know when to set off. The instructor
+gets a private dashboard plus an automatic daily PDF report.
+
+## The three steps of a visit
+
+Every visit goes through the same three taps, in this order. Each one needs the
+student's own **4-digit code**, so nothing is recorded by a stray tap.
+
+| # | Who taps it | Button | What it does |
+|---|---|---|---|
+| 1 | The parent, dropping off | **Parent Check In** | Starts the visit |
+| 2 | The student, work finished | **Done with Work** | **Emails the parent** — ready for pick-up |
+| 3 | The parent, collecting | **Parent Check Out** | Ends the visit |
+
+The kiosk only ever offers the step that comes next, and the server enforces the
+order too — a visit can't be checked out before the student has marked their work
+done.
 
 ## What it does
 
 - **Student kiosk** (`/`) — big buttons, and students don't log in. The tablet
   itself is unlocked once by the instructor at the start of a session and stays
   unlocked all day. Tapping the name box drops down the student list; it filters
-  as the student types, and they tap their name, then **Check In** or
-  **Check Out**.
-- **Instant parent email** — the moment a student checks out, an email goes to the
-  parent address on file ("Kumon: Aadhya checked out at 4:32 PM").
+  as you type. Tap a name, type that student's 4-digit code, and tap the one
+  button on offer.
+- **A 4-digit code per student** — generated automatically when the student is
+  added, unique to them, and required for all three steps. See them all on the
+  dashboard under **Show student codes**, where you can also regenerate one if it
+  gets passed around.
+- **Parent email at the right moment** — sent when the student marks their work
+  done, not at check-out ("Kumon: Aadhya has finished and is ready for
+  pick-up"). That's the moment a parent can act on; by check-out they're standing
+  at the desk doing it themselves.
 - **Instructor dashboard** (`/login` → `/dashboard`) — password protected. Shows
-  every check-in/checkout for a chosen day, whether the parent email succeeded,
-  lets you generate/download a PDF report for any day, and lets you add or
+  all three timestamps for every visit on a chosen day, whether the parent email
+  succeeded, lets you generate/download a PDF report for any day, and lets you
   add, remove, and update students right from the page — including changing a
   parent's email address when it changes, so no spreadsheet re-import is needed
   for day-to-day roster changes.
 - **Nightly reset after closing time** — the center runs 2 PM–10 PM. Every
-  night, anyone who forgot to check out is closed out automatically (stamped
-  10:00 PM, no email sent to the parent), so nobody is left stuck "checked in"
-  and blocked from checking in next session.
+  night, anyone still on the list is closed out automatically (stamped 10:00 PM,
+  no email sent to the parent), whether they never marked their work done or
+  their parent never checked them out. Nobody is left stuck "checked in" and
+  blocked from checking in next session.
 - **PDF reports, built on demand** — nothing is stored on the server. Every
-  visit is in the database, so a report can be rebuilt for **any date, any
-  time** from the dashboard. On session days (**Mondays and Thursdays**) the
-  report is also emailed to `REPORT_EMAIL` at closing time, so there's a
-  permanent copy in the instructor's inbox without the server keeping one.
+  visit is in the database, so a report can be rebuilt **at any time** from the
+  dashboard. Reports cover **session days only** (**Mondays and Thursdays**, per
+  `REPORT_DAYS`): the dashboard offers a dropdown of recent session days rather
+  than an open calendar, because every other date could only ever produce an
+  empty PDF. The one exception is a day that actually has check-ins recorded —
+  a make-up session on an unusual weekday is still downloadable, since the data
+  is real. Session days are also emailed to `REPORT_EMAIL` at closing time, so
+  there's a permanent copy in the instructor's inbox without the server keeping
+  one.
 - **All times are shown as normal 12-hour clock times** (4:05 PM), never
   military time — on the kiosk, the dashboard, the PDF, and the parent email.
 
@@ -55,6 +82,17 @@ daily PDF report.
   within fifteen minutes and that address is locked out for the rest of the
   window, so the login page can't be guessed at from a public URL. A correct
   password clears the count.
+- **What the 4-digit codes are and aren't.** A code stops a student being checked
+  in or out by someone else's stray tap, or as a joke. It is not a password: it
+  guards the three kiosk actions and nothing else — parent email addresses, the
+  roster, and the reports all sit behind the instructor login. Four digits is
+  only ten thousand combinations, so wrong guesses are throttled at five per
+  student per fifteen minutes; working through every code at that rate would take
+  a month of standing at the tablet. A correct code clears the count, and
+  regenerating a student's code clears it too. Codes are never sent to the
+  kiosk — it posts what was typed and the server decides — so they can't be read
+  out of the page, and `/api/student-codes` needs the instructor login rather
+  than just an unlocked tablet.
 - A dashboard session expires after twelve hours, and every form on the site
   carries a one-time token, so another site can't post to the dashboard using a
   logged-in instructor's browser.
@@ -106,10 +144,10 @@ Now edit `.env`:
    `SMTP_USERNAME`, `SMTP_PASSWORD`, and `FROM_EMAIL`. `FROM_EMAIL` is the
    address parents will see the notification come from. For Gmail, use
    `smtp.gmail.com` port `587` with an **App Password** (Google blocks your
-   normal password for SMTP). Until this is filled in, checkouts still work —
-   the dashboard marks them "Not configured" and a line is written to the
-   server log instead of an email being sent, so you can test the whole flow
-   first. Parent addresses are never written to the log.
+   normal password for SMTP). Until this is filled in, all three steps still
+   work — the dashboard marks the email "Not configured" and a line is written
+   to the server log instead of a message being sent, so you can test the whole
+   flow first. Parent addresses are never written to the log.
 
 ## Create the tables
 
@@ -119,11 +157,20 @@ Once, after filling in `.env`:
 python setup_db.py
 ```
 
-This creates the tables and your instructor login. **Re-run it any time you
-change `INSTRUCTOR_USERNAME` or `INSTRUCTOR_PASSWORD` in `.env`**, and any time
-this project adds a table — that sync used to happen every time the app started,
-which stops being reasonable once a host restarts the app hundreds of times a
-day. It's safe to run as often as you like; existing data is left alone.
+This creates the tables, applies any schema changes, and sets up your instructor
+login. **Re-run it any time you change `INSTRUCTOR_USERNAME` or
+`INSTRUCTOR_PASSWORD` in `.env`**, and any time you pull a version of this
+project that changes the database — that sync used to happen every time the app
+started, which stops being reasonable once a host restarts the app hundreds of
+times a day. It's safe to run as often as you like; existing data is left alone.
+
+> **Upgrading to the three-step flow?** Run `python setup_db.py` before starting
+> the app. It adds the new columns and generates a 4-digit code for every student
+> who doesn't have one yet — until it runs, the kiosk will tell students their
+> code isn't set up. Check the new codes on the dashboard under **Show student
+> codes**. Old visits are carried over: a visit that was closed out automatically
+> keeps that mark, and its Done column reads "Not marked", since the step didn't
+> exist when it happened.
 
 To point it at your deployed database rather than a local one, put the
 production `DATABASE_URL` in `.env` and run it from your own machine — the app
@@ -155,6 +202,10 @@ Add `--dry-run` first if you want to preview what would happen without saving
 anything. Re-run the same command any time your roster changes — it updates
 existing students and adds new ones without duplicating anyone.
 
+New students get a 4-digit code on the way in, and students already on the list
+keep the code they have, so re-importing never changes a code a family has
+already been given.
+
 ## Run it
 
 ```bash
@@ -171,10 +222,27 @@ For day-to-day use, run it with a production server instead of the built-in
 dev server:
 
 ```bash
-gunicorn -w 2 -b 0.0.0.0:8000 app:app
+ALLOW_INSECURE_HTTP=1 gunicorn -w 2 -b 0.0.0.0:8000 app:app
 ```
 
 Then point the tablet's browser at `http://<your-computer's-local-IP>:8000/`.
+
+Two things to understand about that command:
+
+- **`SECRET_KEY` is required.** The app refuses to start without one. Session
+  cookies are signed with it, and the fallback used when it's missing is a
+  string published in this repository — anyone on your network could forge an
+  instructor login. Generate one with
+  `python -c "import secrets; print(secrets.token_hex(32))"` and put it in
+  `.env`.
+- **`ALLOW_INSECURE_HTTP=1` is what makes login work over plain `http`.**
+  Without it the session cookie is marked Secure, browsers refuse to send it
+  back over an unencrypted connection, and nobody can log in at all. Only set it
+  on a network you trust — on a public URL it puts the instructor's session on
+  the wire in clear. On Vercel (HTTPS) leave it unset.
+
+For a throwaway local run where you don't want to set anything up, `KUMON_DEV=1
+python app.py` relaxes both requirements. Never set it on a real deployment.
 
 Note that the nightly close-out doesn't run by itself here — it's triggered by
 an HTTP request now (see below), so on a local server you'd want a `cron` entry
@@ -228,10 +296,10 @@ Two things worth knowing about the Vercel environment specifically:
   `requirements.txt`. Without it `REPORT_TIMEZONE` would silently do nothing and
   every time would be recorded in UTC. If that ever happens the server log says
   so explicitly.
-- `vercel.json` allows each request 30 seconds; the check-out email gives up
-  after 10. The email is sent while the student waits, so the mail server has to
-  be the thing that gives up first — otherwise a slow send would fail the whole
-  request for a check-out that actually worked.
+- `vercel.json` allows each request 30 seconds; the parent email gives up after
+  10. The email is sent while the student waits at the "Done with Work" tap, so
+  the mail server has to be the thing that gives up first — otherwise a slow send
+  would fail the whole request for a step that actually worked.
 
 **On the tablet:** browse to the site once at the start of a session, enter the
 instructor username and password, and leave it on the check-in screen. Students
@@ -249,29 +317,32 @@ Set in `.env`:
 - `CENTER_CLOSE_HOUR` / `CENTER_CLOSE_MINUTE` — closing time, default `22:00`
   (10 PM). This is when the day resets and forgotten check-outs are closed.
 - `REPORT_DAYS` — the days the center runs, default `mon,thu`. Comma separated,
-  e.g. `mon,wed,fri`. These are the nights a report is emailed, and the dates
-  offered on the dashboard.
+  e.g. `mon,wed,fri`. Change this and the whole reporting side follows: it sets
+  the nights a report is emailed, the dates the dashboard offers, and the dates
+  a report can be built for at all. If your session days move, this is the only
+  line to edit.
 - `REPORT_EMAIL` — where the nightly report is emailed. Leave blank and none is
-  sent; you can still download any date from the dashboard.
+  sent; you can still download any session day from the dashboard.
 
 The reset runs *every* night, even on non-session days, so a stray check-in
-never carries over. Only the emailed report is limited to `REPORT_DAYS`.
+never carries over. Only reports are limited to `REPORT_DAYS`.
 
 ## Project layout
 
 ```
 app.py                  Flask routes, and the entrypoint Vercel looks for
-db.py                    Postgres schema + connection handling
-setup_db.py               One-time setup: create tables, instructor login, migration
+db.py                    Postgres schema, migrations + connection handling
+setup_db.py               Setup: create tables, apply migrations, instructor login
 vercel.json                 Request time limit + nightly cron schedule
 .python-version              Python version Vercel builds with
 requirements.txt              What the deployed app needs
 requirements-dev.txt           ...plus the tools that only run on your own machine
 time_utils.py                Timezone, 12-hour formatting, closing time, report days
 crypto_utils.py               Email address encryption/decryption
-email_utils.py                 Check-out email sending (with safe log fallback)
-pdf_report.py                  Daily PDF report generation
-import_students.py              Roster importer (reads name + parent email only)
+student_codes.py               4-digit kiosk codes: generation, uniqueness, backfill
+email_utils.py                  Parent email sending (with safe log fallback)
+pdf_report.py                   Daily PDF report generation
+import_students.py               Roster importer (reads name + parent email only)
 templates/                        checkin.html, login.html, dashboard.html
 static/style.css                    Kumon-blue styling
                                      (nothing is written to disk — reports are built

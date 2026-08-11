@@ -16,8 +16,9 @@ from db import get_db, init_db
 from crypto_utils import (
     assert_configured, decrypt_email, encrypt_email, mask_email, normalize_email,
 )
-from email_utils import send_checkout_email, send_report_email
+from email_utils import send_report_email, send_work_done_email
 from pdf_report import generate_report_pdf
+from student_codes import CODE_DIGITS, with_new_code
 from time_utils import (
     close_time, fmt_date, fmt_date_short, fmt_datetime, fmt_time,
     is_report_day, local_now, local_today, report_days,
@@ -29,8 +30,17 @@ load_dotenv()
 def create_app():
     app = Flask(__name__)
 
-    # Vercel sets VERCEL=1, which is a reliable "am I in production" signal.
-    in_production = bool(os.environ.get("VERCEL"))
+    # Safe by default: everything is treated as production unless someone says
+    # otherwise out loud, with KUMON_DEV=1.
+    #
+    # This used to be `bool(os.environ.get("VERCEL"))`, which meant the checks
+    # below only applied on Vercel. The README documents running this on the
+    # center's own network with gunicorn, and there VERCEL is unset - so the app
+    # signed its session cookies with "dev-key-change-me", a string published in
+    # this repository, over plain http. Anyone on the wifi could mint their own
+    # instructor cookie and read every student code and parent address. An
+    # opt-out that has to be typed cannot be reached by forgetting something.
+    in_production = os.environ.get("KUMON_DEV") != "1"
 
     # Refuse to start in production without a real key rather than falling back
     # to one that is published in this repository. Session cookies are signed
@@ -41,12 +51,28 @@ def create_app():
     if not secret_key:
         if in_production:
             raise RuntimeError(
-                "SECRET_KEY is not set. Add it in Vercel: Project Settings -> "
-                "Environment Variables. Generate one with: "
-                "python -c \"import secrets; print(secrets.token_hex(32))\""
+                "SECRET_KEY is not set, and without it session cookies would be "
+                "signed with a key published in this repository - anyone could "
+                "forge an instructor login. Generate one with:\n"
+                "  python -c \"import secrets; print(secrets.token_hex(32))\"\n"
+                "then set it in your host's environment (on Vercel: Project "
+                "Settings -> Environment Variables), or set KUMON_DEV=1 if this "
+                "really is a throwaway local run."
             )
         secret_key = "dev-key-change-me"
     app.secret_key = secret_key
+
+    # Whether the cookie may travel over plain http is a SEPARATE question from
+    # whether this is production, and conflating them breaks one setup or the
+    # other. Secure=True on the README's http://<local-ip>:8000 gunicorn setup
+    # means the browser never sends the cookie back and nobody can log in at
+    # all; Secure=False on Vercel puts the session on the wire in clear. So it
+    # defaults to on in production and has to be turned off deliberately.
+    allow_plain_http = os.environ.get("ALLOW_INSECURE_HTTP") == "1"
+    if in_production and allow_plain_http:
+        print("[startup] WARNING: ALLOW_INSECURE_HTTP=1 - session cookies will be "
+              "sent over unencrypted http. Only do this on a trusted local "
+              "network, never on the public internet.", flush=True)
 
     # Same reasoning, for the key that makes parent addresses readable. Checked
     # here so a misconfigured deployment says so on the first request instead of
@@ -64,7 +90,7 @@ def create_app():
     app.config.update(
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
-        SESSION_COOKIE_SECURE=in_production,
+        SESSION_COOKIE_SECURE=in_production and not allow_plain_http,
         # A dashboard left open on the office computer shouldn't stay logged in
         # forever. Twelve hours covers a full day at the center and expires
         # overnight.
@@ -95,7 +121,7 @@ def create_app():
             return None
         expected = session.get("_csrf", "")
         supplied = request.form.get("_csrf") or request.headers.get("X-CSRF-Token", "")
-        if not expected or not secrets.compare_digest(supplied, expected):
+        if not expected or not same_secret(supplied, expected):
             if request.path.startswith("/api/"):
                 return jsonify({"error": "expired", "login_url": url_for("kiosk_login")}), 403
             # Almost always a form left open until the session expired, so the
@@ -119,14 +145,83 @@ def create_app():
         Returns None for anything that isn't a number, which the callers turn
         into a 404 the same as an unknown student.
         """
-        # silent=True so a malformed body returns None instead of raising, and
-        # `or {}` because a bare "null" body parses to None rather than a dict.
-        payload = request.get_json(silent=True) or {}
+        payload = json_body()
         raw = payload.get("student_id", request.form.get("student_id"))
+        # bool is a subclass of int, so int(True) is 1 - a client bug sending
+        # `true` would silently act on student number 1 instead of 404ing.
+        if isinstance(raw, bool):
+            return None
         try:
             return int(raw)
         except (TypeError, ValueError):
             return None
+
+    def json_body() -> dict:
+        """The JSON body, guaranteed to be a dict.
+
+        silent=True covers a malformed body, but a body that parses to a valid
+        *non-object* - `[1,2]`, `"hi"`, `42`, `true` - is truthy and has no
+        .get, so `get_json(silent=True) or {}` let it through and every kiosk
+        endpoint answered 500.
+        """
+        payload = request.get_json(silent=True)
+        return payload if isinstance(payload, dict) else {}
+
+    def code_param() -> str:
+        """The 4-digit code the student typed, as text.
+
+        Kept as text all the way through. Read as a number, "0421" and "421"
+        would both become 421 and both be accepted, which quietly turns some
+        codes into three-digit ones.
+        """
+        raw = json_body().get("code", request.form.get("code", ""))
+        return str(raw or "").strip()
+
+    def wrong_code(student):
+        """Check the typed code against this student's, and throttle guessing.
+
+        Returns a ready-to-return error response, or None when the code is
+        right and the caller should go ahead.
+
+        Every kiosk action goes through here. The three actions are the three
+        moments something happens that a parent would want to be true - the
+        child arrived, the child finished, the child left with someone - so
+        none of them should be one stray tap away.
+        """
+        if _code_locked_out(student["id"]):
+            return jsonify({
+                "error": f"Too many wrong codes for {student['name']}. "
+                         f"Please ask your instructor for help."
+            }), 429
+
+        stored = (student["code"] or "").strip()
+        if not stored:
+            # Only reachable if setup_db.py hasn't been run since codes were
+            # added. Say which student, so the instructor can fix it.
+            return jsonify({
+                "error": f"{student['name']} doesn't have a code yet. "
+                         f"Please ask your instructor."
+            }), 400
+
+        supplied = code_param()
+
+        # A submission that isn't even the right shape is not a guess, and must
+        # not count as one. It used to: five blank submissions locked a student
+        # out for fifteen minutes, and since /api/students hands the kiosk every
+        # student id, anyone standing at the tablet could loop the roster and
+        # lock all of them out - including the check-out step, so students could
+        # not be signed out by their parents.
+        if not supplied.isdigit() or len(supplied) != CODE_DIGITS:
+            return jsonify({"error": f"Please enter the {CODE_DIGITS}-digit code."}), 403
+
+        # same_secret rather than compare_digest directly: the value is whatever
+        # was typed, and compare_digest raises on non-ASCII text.
+        if not same_secret(supplied, stored):
+            _record_failed_code(student["id"])
+            return jsonify({"error": "That code isn't right. Please try again."}), 403
+
+        _clear_code_attempts(student["id"])
+        return None
 
     # ---------- auth helpers ----------
     # There are two doors, and one key. The kiosk needs unlocking before anyone
@@ -166,19 +261,24 @@ def create_app():
     @app.get("/api/students")
     @kiosk_required
     def api_students():
-        """The roster, each name already carrying whether they're checked in.
+        """The roster, each name already carrying which step it's up to.
 
         This used to return names only, which meant the kiosk had to make a
         second request the moment a student tapped their name, and couldn't
-        show the right button until it came back. Sending the status up front
+        show the right button until it came back. Sending the stage up front
         is a few extra bytes per student and removes that wait entirely.
+
+        Codes are deliberately not in here. The kiosk never needs to know them
+        - it sends what was typed and the server decides - and anything this
+        endpoint returns can be read straight out of the page by anyone
+        standing at the tablet, which would make the whole list public.
 
         The LEFT JOIN can't multiply rows: the unique index on open visits
         guarantees at most one per student.
         """
         db = get_db()
         rows = db.execute(
-            "SELECT s.id, s.name, v.check_in_time "
+            "SELECT s.id, s.name, v.check_in_time, v.work_done_time, v.email_status "
             "FROM students s "
             "LEFT JOIN visits v ON v.student_id = s.id AND v.check_out_time IS NULL "
             "WHERE s.active = 1 ORDER BY s.name"
@@ -187,20 +287,44 @@ def create_app():
             {
                 "id": r["id"],
                 "name": r["name"],
-                "checked_in": r["check_in_time"] is not None,
+                "stage": visit_stage(r["check_in_time"], r["work_done_time"]),
                 "check_in_display": fmt_time(r["check_in_time"]) if r["check_in_time"] else None,
+                "work_done_display": fmt_time(r["work_done_time"]) if r["work_done_time"] else None,
+                # Whether the parent actually got the message, so the panel can
+                # say so honestly after a roster refresh. Not the raw status:
+                # that is instructor-facing detail and this endpoint is readable
+                # by anyone at the tablet.
+                "emailed": r["email_status"] == "sent",
             }
             for r in rows
         ])
+
+    # The kiosk is three steps now, in this order, each needing the student's
+    # code:
+    #
+    #   1. Parent Check In   - the parent drops the student off.
+    #   2. Done with Work    - the student has finished. This emails the parent.
+    #   3. Parent Check Out  - the parent collects the student.
+    #
+    # The order is enforced here, not just in the interface. The kiosk only ever
+    # offers the next step, but it decides that from a roster it may have loaded
+    # some minutes ago, so the server is what actually guarantees that no visit
+    # skips a stage.
 
     @app.post("/api/checkin")
     @kiosk_required
     def api_checkin():
         student_id = student_id_param()
         db = get_db()
-        student = db.execute("SELECT id, name FROM students WHERE id = %s", (student_id,)).fetchone()
+        student = db.execute(
+            "SELECT id, name, code FROM students WHERE id = %s", (student_id,)
+        ).fetchone()
         if not student:
             return jsonify({"error": "Student not found."}), 404
+
+        denied = wrong_code(student)
+        if denied:
+            return denied
 
         now = local_now().isoformat(timespec="seconds")
         # Guarded insert: the WHERE NOT EXISTS is evaluated as part of the same
@@ -227,31 +351,146 @@ def create_app():
             return jsonify({"error": f"{student['name']} is already checked in."}), 400
         return jsonify({
             "message": f"{student['name']} checked in at {fmt_time(now)}!",
+            "stage": "checked_in",
             "time": now,
             "time_display": fmt_time(now),
+        })
+
+    @app.post("/api/work-done")
+    @kiosk_required
+    def api_work_done():
+        """The student has finished. This is what emails the parent."""
+        student_id = student_id_param()
+        db = get_db()
+        student = db.execute(
+            "SELECT id, name, code, email_enc FROM students WHERE id = %s", (student_id,)
+        ).fetchone()
+        if not student:
+            return jsonify({"error": "Student not found."}), 404
+
+        denied = wrong_code(student)
+        if denied:
+            return denied
+
+        now = local_now()
+        now_iso = now.isoformat(timespec="seconds")
+
+        # Claim the visit BEFORE sending anything. The "AND work_done_time IS
+        # NULL" means only one request can win, so an impatient student tapping
+        # the button five times still results in exactly one email to their
+        # parent. Sending first and writing afterwards would send one per tap.
+        cur = db.execute(
+            "UPDATE visits SET work_done_time = %s "
+            "WHERE id = (SELECT id FROM visits WHERE student_id = %s "
+            "            AND check_out_time IS NULL AND work_done_time IS NULL "
+            "            ORDER BY check_in_time DESC LIMIT 1) "
+            "AND work_done_time IS NULL "
+            "RETURNING id",
+            (now_iso, student_id),
+        )
+        row = cur.fetchone() if cur.rowcount else None
+        db.commit()
+        if row is None:
+            # Nothing to claim, for one of two reasons, and they need different
+            # answers: one means "get a grown-up", the other means "you already
+            # did this, sit tight".
+            open_visit = db.execute(
+                "SELECT work_done_time, email_status FROM visits "
+                "WHERE student_id = %s AND check_out_time IS NULL",
+                (student_id,),
+            ).fetchone()
+            if open_visit:
+                # Whether the parent was actually told is read from the row, not
+                # assumed. This used to say "Their parent has been emailed."
+                # unconditionally, so a student whose first tap failed to send
+                # was reassured on the second tap and stopped telling anyone -
+                # the one case where a parent is left waiting and nobody knows.
+                if open_visit["email_status"] == "sent":
+                    tail = "Their parent has been emailed."
+                else:
+                    tail = ("We still could not email their parent — "
+                            "please tell your instructor.")
+                return jsonify({
+                    "error": f"{student['name']} already finished at "
+                             f"{fmt_time(open_visit['work_done_time'])}. {tail}"
+                }), 400
+            return jsonify({"error": f"{student['name']} is not checked in yet."}), 400
+
+        # RETURNING gives us the row we just claimed, rather than a follow-up
+        # SELECT that could pick the wrong visit.
+        visit_id = row["id"]
+
+        email = decrypt_email(student["email_enc"])
+        email_status = send_work_done_email(email, student["name"], now)
+
+        db.execute(
+            "UPDATE visits SET email_status = %s WHERE id = %s",
+            (email_status, visit_id),
+        )
+        db.commit()
+
+        # Finishing succeeded either way - the time is recorded and the student
+        # can pack up. What may have failed is telling their parent, and only a
+        # person can fix that, so say so plainly instead of burying it in a
+        # green tick. It matters more than it used to: the parent may be waiting
+        # on this email before setting off.
+        problems = {
+            "failed": "We could not email your parent, so they don't know you're "
+                      "finished. Please tell your instructor.",
+            "partial": "We could only reach one of your parents' email addresses. "
+                       "Please tell your instructor.",
+            "not_configured": "Parent emails aren't switched on yet, so nobody was emailed. "
+                              "Please tell your instructor.",
+            "no_address": "We don't have a parent email on file for you, so nobody was emailed. "
+                          "Please tell your instructor.",
+        }
+        problem = problems.get(email_status)
+
+        # The headline has to match the follow-up. It was hardcoded to "Your
+        # parent has been emailed", which the kiosk then rendered immediately
+        # above "We could not email your parent" - one toast contradicting
+        # itself in consecutive sentences.
+        headline = (f"Nice work, {student['name']}! Your parent has been emailed."
+                    if email_status == "sent"
+                    else f"Nice work, {student['name']}! Your work is marked as done.")
+
+        return jsonify({
+            "message": headline,
+            "stage": "work_done",
+            "email_ok": email_status == "sent",
+            "problem": problem,
+            "time": now_iso,
+            "time_display": fmt_time(now),
+            "email_status": email_status,
         })
 
     @app.post("/api/checkout")
     @kiosk_required
     def api_checkout():
+        """The parent collects the student. No email - they're standing here."""
         student_id = student_id_param()
         db = get_db()
         student = db.execute(
-            "SELECT id, name, email_enc FROM students WHERE id = %s", (student_id,)
+            "SELECT id, name, code FROM students WHERE id = %s", (student_id,)
         ).fetchone()
         if not student:
             return jsonify({"error": "Student not found."}), 404
 
+        denied = wrong_code(student)
+        if denied:
+            return denied
+
         now = local_now()
         now_iso = now.isoformat(timespec="seconds")
 
-        # Claim the visit BEFORE sending anything. The "AND check_out_time IS NULL"
-        # means only one request can win, so an impatient student tapping Check Out
-        # five times still results in exactly one email to their parent. Sending
-        # first and writing afterwards would send one email per tap.
+        # "AND work_done_time IS NOT NULL" is what keeps the three steps in
+        # order: a visit cannot be checked out until the student has said they
+        # finished, so no visit ends up with a pick-up time and no record of
+        # what the student was there for.
         cur = db.execute(
             "UPDATE visits SET check_out_time = %s "
-            "WHERE id = (SELECT id FROM visits WHERE student_id = %s AND check_out_time IS NULL "
+            "WHERE id = (SELECT id FROM visits WHERE student_id = %s "
+            "            AND check_out_time IS NULL AND work_done_time IS NOT NULL "
             "            ORDER BY check_in_time DESC LIMIT 1) "
             "AND check_out_time IS NULL "
             "RETURNING id",
@@ -260,43 +499,22 @@ def create_app():
         row = cur.fetchone() if cur.rowcount else None
         db.commit()
         if row is None:
+            open_visit = db.execute(
+                "SELECT id FROM visits WHERE student_id = %s AND check_out_time IS NULL",
+                (student_id,),
+            ).fetchone()
+            if open_visit:
+                return jsonify({
+                    "error": f"{student['name']} hasn't finished their work yet. "
+                             f"Tap “Done with Work” first."
+                }), 400
             return jsonify({"error": f"{student['name']} is not currently checked in."}), 400
 
-        # RETURNING gives us the row we just claimed. The old follow-up SELECT
-        # matched on check_out_time, which would pick the wrong visit if the
-        # same student somehow had two rows stamped in the same second.
-        visit_id = row["id"]
-
-        email = decrypt_email(student["email_enc"])
-        email_status = send_checkout_email(email, student["name"], now)
-
-        db.execute(
-            "UPDATE visits SET email_status = %s WHERE id = %s",
-            (email_status, visit_id),
-        )
-        db.commit()
-
-        # The check-out itself succeeded either way - the visit is recorded and
-        # the student is free to leave. What may have failed is telling their
-        # parent, and only a person can fix that, so say so plainly instead of
-        # burying it in a green tick. The old copy claimed "the instructor has
-        # been notified", which was not true of anything the code did.
-        problems = {
-            "failed": "We could not email your parent. Please tell your instructor before you leave.",
-            "not_configured": "Parent emails aren't switched on yet, so nobody was emailed. "
-                              "Please tell your instructor.",
-            "no_address": "We don't have a parent email on file for you, so nobody was emailed. "
-                          "Please tell your instructor.",
-        }
-        problem = problems.get(email_status)
-
         return jsonify({
-            "message": f"{student['name']} checked out at {fmt_time(now)}.",
-            "email_ok": email_status == "sent",
-            "problem": problem,
+            "message": f"{student['name']} checked out at {fmt_time(now)}. See you next time!",
+            "stage": "out",
             "time": now_iso,
             "time_display": fmt_time(now),
-            "email_status": email_status,
         })
 
     # ---------- auth ----------
@@ -329,12 +547,9 @@ def create_app():
                 # Only same-site paths. The decorators only ever set `next` to a
                 # local path, but the URL is user-supplied, so "next=https://
                 # elsewhere" would otherwise hand a freshly logged-in instructor
-                # to another site. "//host" is a protocol-relative URL, so it has
-                # to be rejected too even though it starts with a slash.
-                nxt = request.args.get("next") or ""
-                if not nxt.startswith("/") or nxt.startswith("//"):
-                    nxt = default_next
-                return redirect(nxt)
+                # to another site. See safe_next() for why checking the raw
+                # string is not enough.
+                return redirect(safe_next(request.args.get("next"), default_next))
             _record_failed_login()
             flash("Incorrect username or password.")
         return render_template("login.html", show_kiosk_link=show_kiosk_link)
@@ -376,7 +591,8 @@ def create_app():
 
         rows = db.execute(
             """
-            SELECT v.id, s.name AS name, v.check_in_time, v.check_out_time, v.email_status, s.email_enc
+            SELECT v.id, s.name AS name, v.check_in_time, v.work_done_time, v.check_out_time,
+                   v.email_status, v.auto_closed, s.email_enc
             FROM visits v JOIN students s ON s.id = v.student_id
             WHERE v.check_in_time::date = %s::date
             ORDER BY v.check_in_time DESC
@@ -390,27 +606,40 @@ def create_app():
                 "id": r["id"],
                 "name": r["name"],
                 "check_in_time": r["check_in_time"],
+                "work_done_time": r["work_done_time"],
                 "check_out_time": r["check_out_time"],
                 "email_status": r["email_status"],
+                "auto_closed": bool(r["auto_closed"]),
                 "email_masked": mask_email(decrypt_email(r["email_enc"])),
             })
 
         student_rows = db.execute(
-            "SELECT id, name, email_enc FROM students WHERE active = 1 ORDER BY name"
+            "SELECT id, name, email_enc, code FROM students WHERE active = 1 ORDER BY name"
         ).fetchall()
         students = [
-            {"id": r["id"], "name": r["name"],
+            {"id": r["id"], "name": r["name"], "code": r["code"],
              "email_masked": mask_email(decrypt_email(r["email_enc"]))}
             for r in student_rows
         ]
 
         closing = close_time()
+        listed_dates = report_dates()
+        # What the "any other session day" dropdown offers. Built from the
+        # calendar, so it covers session days the list above leaves out for
+        # having no check-ins - a Monday nobody attended is still a fair
+        # question to ask - minus the ones already listed, so no date appears
+        # in both places.
+        listed = set(listed_dates)
+        other_days = group_by_month(
+            [d for d in recent_session_days() if d not in listed]
+        )
         return render_template(
             "dashboard.html",
             visits=visits,
             selected_date=day_str,
             today=local_today().isoformat(),
-            session_dates=report_dates(),
+            session_dates=listed_dates,
+            other_session_days=other_days,
             students=students,
             student_count=len(students),
             close_time_display=fmt_time(datetime.combine(local_today(), closing)),
@@ -440,7 +669,7 @@ def create_app():
         # alone, so it would then update whichever of the two it happened to
         # find first. Re-adding someone reactivates the row that already exists.
         existing = db.execute(
-            "SELECT id, active FROM students WHERE name = %s", (name,)
+            "SELECT id, active, code FROM students WHERE name = %s", (name,)
         ).fetchone()
 
         if existing and existing["active"]:
@@ -453,15 +682,64 @@ def create_app():
                 (encrypt_email(email), existing["id"]),
             )
             db.commit()
-            flash(f"{name} was previously removed — added back with that email.")
+            # They keep the code they had, so a student who left and came back
+            # doesn't have to learn a new one. A student from before codes
+            # existed, or one whose row predates the migration, gets one now -
+            # and is told it's new, because nobody has ever been given it.
+            if existing["code"]:
+                flash(f"{name} was previously removed — added back with that email. "
+                      f"Their code is still {existing['code']}.")
+            else:
+                flash(f"{name} was previously removed — added back with that email. "
+                      f"Their new 4-digit code is {_assign_code(db, existing['id'])}.")
             return redirect(url_for("dashboard"))
 
-        db.execute(
-            "INSERT INTO students (name, email_enc, active) VALUES (%s, %s, 1)",
-            (name, encrypt_email(email)),
+        _, code = with_new_code(
+            db,
+            lambda code: db.execute(
+                "INSERT INTO students (name, email_enc, active, code) VALUES (%s, %s, 1, %s)",
+                (name, encrypt_email(email), code),
+            ),
         )
         db.commit()
-        flash(f"Added {name}.")
+        flash(f"Added {name}. Their 4-digit code is {code}.")
+        return redirect(url_for("dashboard"))
+
+    @app.get("/api/student-codes")
+    @login_required
+    def api_student_codes():
+        """Names and codes, for the panel on the dashboard.
+
+        Instructor login only - deliberately not @kiosk_required. The kiosk
+        unlocks once in the morning and stays unlocked on a tablet in the
+        lobby; if that were enough to reach this, every code would be one URL
+        away from anyone who picked the tablet up.
+        """
+        db = get_db()
+        rows = db.execute(
+            "SELECT id, name, code FROM students WHERE active = 1 ORDER BY name"
+        ).fetchall()
+        return jsonify([
+            {"id": r["id"], "name": r["name"], "code": r["code"]} for r in rows
+        ])
+
+    @app.post("/dashboard/students/<int:student_id>/code")
+    @login_required
+    def regenerate_student_code(student_id):
+        """Give a student a new code, for when the old one has got around."""
+        db = get_db()
+        student = db.execute(
+            "SELECT id, name FROM students WHERE id = %s", (student_id,)
+        ).fetchone()
+        if not student:
+            flash("That student isn't on the list.")
+            return redirect(url_for("dashboard"))
+
+        code = _assign_code(db, student_id)
+        # The old code stops working the moment this runs, so the student has to
+        # be told the new one - hence showing it here rather than just saying
+        # "done".
+        flash(f"{student['name']}'s new code is {code}. The old one no longer works.")
         return redirect(url_for("dashboard"))
 
     @app.post("/dashboard/students/<int:student_id>/email")
@@ -523,10 +801,16 @@ def create_app():
             flash("That isn't a valid date.")
             return redirect(url_for("dashboard"))
 
-        # The date picker sets max="today", but the URL is typed as easily as
-        # it is clicked, and a future date can only ever produce a blank PDF.
+        # The dropdown only offers sensible dates, but the URL is typed as
+        # easily as it is clicked, and a future date can only ever produce a
+        # blank PDF.
         if day > local_today():
             flash("That date hasn't happened yet.")
+            return redirect(url_for("dashboard"))
+
+        if report_is_pointless(day):
+            flash(f"Nothing to report for {fmt_date(day)} — the center runs on "
+                  f"{_report_days_display()}, and nobody checked in that day.")
             return redirect(url_for("dashboard"))
 
         buf = build_report_pdf(day)
@@ -555,6 +839,11 @@ def create_app():
             return redirect(url_for("dashboard"))
         if day > local_today():
             flash("That date hasn't happened yet.")
+            return redirect(url_for("dashboard"))
+
+        if report_is_pointless(day):
+            flash(f"Nothing to report for {fmt_date(day)} — the center runs on "
+                  f"{_report_days_display()}, and nobody checked in that day.")
             return redirect(url_for("dashboard"))
 
         destination = (os.environ.get("REPORT_EMAIL") or "").strip()
@@ -597,7 +886,7 @@ def create_app():
         # compare_digest rather than != so the comparison doesn't return early
         # on the first wrong character. Without this check at all, anyone who
         # found the URL could close out the center.
-        if not expected or not secrets.compare_digest(supplied, f"Bearer {expected}"):
+        if not expected or not same_secret(supplied, f"Bearer {expected}"):
             return jsonify({"error": "unauthorized"}), 401
 
         closed = _close_open_visits()
@@ -628,6 +917,15 @@ def create_app():
 
 DEFAULT_SESSION_DATES_SHOWN = 10
 
+# How far back the "any other session day" dropdown reaches, in calendar days.
+#
+# Much further than the ten rows listed above it, because a dropdown costs no
+# space on the page: it is one closed control whether it holds five entries or
+# five hundred, and it scrolls inside its own menu rather than lengthening the
+# dashboard. A year means last term's reports are still one click away instead
+# of only reachable by typing a URL from memory.
+SESSION_DAYS_OFFERED_WITHIN = 365
+
 # A session day with this many check-ins or fewer doesn't get an emailed report.
 # Guards against a holiday Monday producing a blank PDF in the inbox. Nothing is
 # lost when it triggers: the day is still downloadable from the dashboard.
@@ -636,6 +934,14 @@ MIN_VISITS_FOR_EMAILED_REPORT = 3
 # How long a run of failed logins is remembered, and how many are allowed in it.
 LOGIN_WINDOW_MINUTES = 15
 LOGIN_MAX_ATTEMPTS = 10
+
+# The same, for wrong 4-digit codes at the kiosk. Tighter than the login limit
+# because the secret is so much smaller: at five tries per quarter hour, working
+# through ten thousand codes would take a month of standing at the tablet. Low
+# enough to matter, high enough that a student who mistypes twice and then gets
+# it right never notices it exists.
+CODE_WINDOW_MINUTES = 15
+CODE_MAX_ATTEMPTS = 5
 
 
 def center_name() -> str:
@@ -661,6 +967,44 @@ def _static_version() -> str:
         return f"{int(stat.st_mtime)}-{stat.st_size}"
     except OSError:
         return "1"
+
+
+def same_secret(supplied, expected) -> bool:
+    """Constant-time comparison that survives whatever arrives from the network.
+
+    secrets.compare_digest raises TypeError when either str argument contains a
+    non-ASCII character, and every caller here compares something a stranger
+    typed. That turned an Arabic-Indic or fullwidth digit - what an iPad set to
+    another numeral system produces - into a 500 instead of "that code isn't
+    right", and let anyone crash the public cron endpoint with one header. Bytes
+    have no such restriction, so encode first.
+    """
+    try:
+        return secrets.compare_digest(str(supplied).encode("utf-8"),
+                                      str(expected).encode("utf-8"))
+    except (UnicodeEncodeError, AttributeError):
+        return False
+
+
+def safe_next(candidate: str, fallback: str) -> str:
+    """A ?next= value that cannot leave this site.
+
+    Checking `startswith("/")` on the raw string is not enough. Werkzeug strips
+    tab and newline when it writes the Location header, so "/%09/evil.com"
+    passes the check as a relative path and is then emitted as "//evil.com" - a
+    protocol-relative URL that sends a freshly logged-in instructor to another
+    site, having just typed their password into the real one. A newline instead
+    made Werkzeug raise, 500-ing an otherwise successful login.
+
+    So: strip what the header serializer would strip, then validate. Backslashes
+    are rejected too because browsers treat "/\\evil.com" as "//evil.com".
+    """
+    cleaned = (candidate or "").translate({0x09: None, 0x0A: None, 0x0D: None, 0x00: None})
+    if not cleaned.startswith("/"):
+        return fallback
+    if cleaned.startswith("//") or cleaned.startswith("/\\"):
+        return fallback
+    return cleaned
 
 
 def csrf_token() -> str:
@@ -693,11 +1037,21 @@ def last_session_day():
 
 
 def _client_ip() -> str:
-    """The visitor's address. Behind Vercel's proxy remote_addr is the proxy, so
-    the first entry of X-Forwarded-For is the real client."""
+    """The visitor's address, for throttling failed logins.
+
+    The LAST entry of X-Forwarded-For, not the first. The header is a chain that
+    each proxy appends to, so the leftmost entry is whatever the *client* sent -
+    it is data from the attacker, not about them. Reading it meant a script
+    could rotate one header value and guess passwords forever: ten failures,
+    change the header, ten more. The rightmost entry is the one written by the
+    proxy directly in front of this app, which a client cannot forge.
+
+    This is correct for exactly one trusted proxy (Vercel's edge). Behind two,
+    the second-from-last would be the one to read.
+    """
     forwarded = request.headers.get("X-Forwarded-For", "")
     if forwarded:
-        return forwarded.split(",")[0].strip()[:100]
+        return forwarded.split(",")[-1].strip()[:100]
     return (request.remote_addr or "unknown")[:100]
 
 
@@ -752,6 +1106,131 @@ def _clear_login_attempts():
         db.rollback()
 
 
+def _assign_code(db, student_id) -> str:
+    """Put a fresh code on a student and return it.
+
+    Wrong-guess history is wiped at the same time. Otherwise a student locked
+    out by someone else's guessing would still be locked out after the
+    instructor handed them a new code, which is exactly the moment the lock has
+    stopped being useful.
+    """
+    _, code = with_new_code(
+        db,
+        lambda code: db.execute(
+            "UPDATE students SET code = %s WHERE id = %s", (code, student_id)
+        ),
+    )
+    db.commit()
+    _clear_code_attempts(student_id)
+    return code
+
+
+def visit_stage(check_in_time, work_done_time) -> str:
+    """Which of the three steps a student is up to.
+
+    'out'        - not here, or already collected. Next: Parent Check In.
+    'checked_in' - here and working.               Next: Done with Work.
+    'work_done'  - finished, waiting to go home.   Next: Parent Check Out.
+
+    Derived from the timestamps rather than stored as a column of its own, so
+    there is no way for a stage to disagree with the times it is meant to
+    describe. Both arguments come from the open visit, or are None when the
+    student hasn't got one.
+    """
+    if check_in_time is None:
+        return "out"
+    return "work_done" if work_done_time else "checked_in"
+
+
+def _code_locked_out(student_id) -> bool:
+    """True once someone has guessed wrong at this student too many times.
+
+    Per student rather than per address: the tablet is one device that everyone
+    shares, so throttling by IP would let one wrong guess for one student start
+    locking out the whole center.
+
+    Fails open if the table isn't there, for the same reason as the login
+    throttle - a kiosk nobody can use is worse than an unthrottled one.
+    """
+    db = get_db()
+    try:
+        row = db.execute(
+            "SELECT count(*) AS n FROM code_attempts "
+            "WHERE student_id = %s AND attempted_at > %s",
+            (student_id, _code_window_start()),
+        ).fetchone()
+    except psycopg.errors.UndefinedTable:
+        db.rollback()
+        print("[code] WARNING: no code_attempts table, so wrong student codes are "
+              "not being throttled. Run: python setup_db.py", flush=True)
+        return False
+    return row["n"] >= CODE_MAX_ATTEMPTS
+
+
+def _code_window_start() -> str:
+    return (local_now() - timedelta(minutes=CODE_WINDOW_MINUTES)).isoformat(timespec="seconds")
+
+
+def _record_failed_code(student_id):
+    db = get_db()
+    try:
+        db.execute(
+            "INSERT INTO code_attempts (student_id, attempted_at) VALUES (%s, %s)",
+            (student_id, local_now().isoformat(timespec="seconds")),
+        )
+        # Rows older than the window can never matter again, so pruning here
+        # saves needing a cleanup job.
+        db.execute("DELETE FROM code_attempts WHERE attempted_at < %s", (_code_window_start(),))
+        db.commit()
+    except psycopg.errors.UndefinedTable:
+        db.rollback()
+
+
+def _clear_code_attempts(student_id):
+    """A correct code wipes the slate, so a couple of fumbled digits don't lock
+    a student out of checking themselves in later in the session."""
+    db = get_db()
+    try:
+        db.execute("DELETE FROM code_attempts WHERE student_id = %s", (student_id,))
+        db.commit()
+    except psycopg.errors.UndefinedTable:
+        db.rollback()
+
+
+def recent_session_days(within_days=SESSION_DAYS_OFFERED_WITHIN):
+    """Every session day in the last `within_days` days, newest first.
+
+    Worked out from the calendar rather than from the database, so a session day
+    nobody attended is still offered - a report showing an empty Monday is a
+    real answer to "did anyone come in?", where a missing entry just looks like
+    the system lost it.
+
+    A window rather than a count, so the answer stays "about a year" whatever
+    REPORT_DAYS says. Counting instead would mean two session days a week
+    reaches back a year and five reaches back five months, silently, with
+    nothing on screen explaining why last spring had gone missing.
+    """
+    today = local_today()
+    return [day for day in (today - timedelta(days=n) for n in range(within_days + 1))
+            if is_report_day(day)]
+
+
+def group_by_month(days):
+    """[(month label, [dates])] - newest month first, for a grouped dropdown.
+
+    A year of Mondays and Thursdays is a hundred-odd entries. As one flat list
+    that is a wall of near-identical dates to scroll; broken into months it is
+    something you can aim at.
+    """
+    months = []
+    for day in days:
+        label = day.strftime("%B %Y")
+        if not months or months[-1][0] != label:
+            months.append((label, []))
+        months[-1][1].append(day)
+    return months
+
+
 def report_dates(count=DEFAULT_SESSION_DATES_SHOWN):
     """Dates worth offering a report for: today, plus past days that actually
     have check-ins recorded. Newest first.
@@ -763,8 +1242,14 @@ def report_dates(count=DEFAULT_SESSION_DATES_SHOWN):
     days have visits means the list only ever contains reports with something
     in them.
 
-    Today is always offered even when it's empty, so the instructor can pull a
-    partial report during a session that's still running.
+    Today is offered even when it's empty - but only if the center actually
+    meets today, so a Tuesday doesn't sit at the top of the list promising a
+    report that could only ever come out blank.
+
+    Days with visits are listed whatever weekday they fall on. The center runs
+    Mondays and Thursdays, but if a make-up session ever happens on a Wednesday
+    those check-ins are real and the report has something in it, so hiding it
+    for not matching the timetable would lose data that exists.
     """
     db = get_db()
     today = local_today()
@@ -774,10 +1259,26 @@ def report_dates(count=DEFAULT_SESSION_DATES_SHOWN):
         "ORDER BY day DESC LIMIT %s",
         (today.isoformat(), count),
     ).fetchall()
+    # Trim first, then prepend today. Slicing last meant adding today pushed a
+    # real day off the end - and if that day was a make-up session on an unusual
+    # weekday, it vanished from the dashboard entirely, because the dropdown
+    # beside this list is built from the calendar and only ever offers session
+    # weekdays.
     days = [r["day"] for r in rows]
-    if today not in days:
-        days.insert(0, today)
-    return days[:count]
+    if today in days or not is_report_day(today):
+        return days[:count]
+    return [today] + days[:count - 1]
+
+
+def report_is_pointless(day) -> bool:
+    """True for a date that can only ever produce an empty PDF.
+
+    A day the center doesn't run, with nothing recorded on it. Both halves
+    matter: a session day is always worth a report even if it turns out empty
+    (that is itself the answer), and a day with visits is always worth one no
+    matter which weekday it lands on.
+    """
+    return not is_report_day(day) and count_visits(day) == 0
 
 
 def count_visits(day) -> int:
@@ -806,6 +1307,14 @@ def _close_open_visits():
     telling a parent 'checked out at 10:00 PM' would be a guess presented as fact.
     Returns the number of visits closed.
 
+    Both open stages are swept up: a student who never said they were done, and
+    a student who did but whose parent never checked them out. Only
+    check_out_time is filled in — work_done_time is left alone, so a blank one
+    still means "never told us they finished" rather than being back-filled with
+    a time nobody observed. email_status is untouched for the same reason: if
+    the parent was emailed at pick-up-ready time, that happened, and the
+    close-out shouldn't overwrite the record of it.
+
     Runs inside the caller's app context. It used to push its own, which was
     free under a background scheduler that had none; called from a request it
     would open a second connection to do work the first one could already do.
@@ -826,11 +1335,19 @@ def _close_open_visits():
         # A check-in after closing time would otherwise get a negative duration.
         if close_dt < checked_in:
             close_dt = checked_in
-        db.execute(
-            "UPDATE visits SET check_out_time = %s, email_status = %s WHERE id = %s",
-            (close_dt.isoformat(timespec="seconds"), "auto_closed", visit["id"]),
+        # "AND check_out_time IS NULL" matters even though the SELECT above only
+        # returned open visits: the list is read once and then updated row by
+        # row with no commit until the end, and the cron runs at 11 PM local in
+        # winter - an hour after closing, with stragglers still plausible. A
+        # parent checking out in that window would otherwise have the time they
+        # actually arrived overwritten with the 10 PM stamp and the visit marked
+        # as nobody-collected-them.
+        cur = db.execute(
+            "UPDATE visits SET check_out_time = %s, auto_closed = 1 "
+            "WHERE id = %s AND check_out_time IS NULL",
+            (close_dt.isoformat(timespec="seconds"), visit["id"]),
         )
-        closed += 1
+        closed += cur.rowcount
     db.commit()
     return closed
 
@@ -846,7 +1363,8 @@ def build_report_pdf(report_date) -> io.BytesIO:
     db = get_db()
     rows = db.execute(
         """
-        SELECT s.name AS name, v.check_in_time, v.check_out_time, v.email_status
+        SELECT s.name AS name, v.check_in_time, v.work_done_time, v.check_out_time,
+               v.email_status, v.auto_closed
         FROM visits v JOIN students s ON s.id = v.student_id
         WHERE v.check_in_time::date = %s::date
         """,

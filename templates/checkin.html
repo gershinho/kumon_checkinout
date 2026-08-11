@@ -5,7 +5,7 @@
 <div class="kiosk-wrap">
   <header class="kiosk-header">
     <h1>{{ center_name }}</h1>
-    <p class="subtitle">Tap your name to check in or check out</p>
+    <p class="subtitle">Tap a name, then enter that student's 4-digit code</p>
   </header>
 
   <div class="search-wrap">
@@ -23,12 +23,25 @@
     <div class="action-card">
       <h2 id="action-name"></h2>
       <p id="action-status" class="action-status"></p>
+      <div class="code-entry">
+        <label for="code" id="code-label">4-digit code</label>
+        {# inputmode="numeric" brings up the number pad on a tablet rather than
+           the full keyboard. type="password" keeps the code off the screen -
+           it's typed at a kiosk in a lobby with other families standing
+           behind. #}
+        <input id="code" type="password" inputmode="numeric" pattern="[0-9]*"
+               maxlength="4" autocomplete="off" autocorrect="off"
+               spellcheck="false" placeholder="••••" aria-describedby="code-help">
+        <p id="code-help" class="code-help">Ask your instructor if you don't know it.</p>
+      </div>
       <div class="action-buttons">
-        {# Both start hidden. Whether a student can check in or out isn't known
-           until the server answers, and showing both in the meantime made the
-           wrong one flash up for a moment on every single tap. #}
-        <button id="btn-checkin" class="big-btn btn-checkin hidden">Check In</button>
-        <button id="btn-checkout" class="big-btn btn-checkout hidden">Check Out</button>
+        {# All three start hidden. Which step a student is up to isn't known
+           until the server answers, and showing them in the meantime made the
+           wrong one flash up for a moment on every single tap. Exactly one is
+           ever shown: the next step for this student. #}
+        <button id="btn-checkin" class="big-btn btn-checkin hidden">Parent Check In</button>
+        <button id="btn-workdone" class="big-btn btn-workdone hidden">Done with Work</button>
+        <button id="btn-checkout" class="big-btn btn-checkout hidden">Parent Check Out</button>
       </div>
       <button id="btn-cancel" class="link-btn">Not you? Go back</button>
     </div>
@@ -57,21 +70,86 @@ const hintEl = document.getElementById('hint');
    that happens the server answers with a lock code instead of data, and the
    tablet sends itself back to the login page rather than sitting there looking
    broken or trying to read a login page as if it were a student list. */
-function isLocked(res) {
-  return res.status === 401 || res.status === 403;
+/* Only the server decides this, and it says so by sending a login_url. Both
+   replies that genuinely require signing in again carry one: the kiosk lock
+   (401) and the expired-session CSRF reply (403).
+
+   This used to be `status === 401 || status === 403`, which was fine until a
+   wrong 4-digit code also started answering 403. Every mistyped digit then
+   navigated the tablet off the kiosk to an instructor login form - with no
+   "Back to check-in" link on it - taking the lobby out of service for every
+   family behind that student, over a typo. Reading the body instead means a new
+   403 can never silently do that again. */
+function locksUs(data) {
+  return Boolean(data && data.login_url);
 }
 
-function goToLogin() {
-  window.location.href = '/kiosk-login';
+function goToLogin(url) {
+  window.location.href = url || '/kiosk-login';
 }
+
+/* Parse a response body without throwing on a non-JSON one. A platform 502 or
+   an HTML error page would otherwise land in the catch below and be reported to
+   the student as "couldn't reach the check-in system", sending the instructor
+   to check the wifi for a server-side problem. */
+async function readBody(res) {
+  try {
+    return await res.json();
+  } catch (err) {
+    return null;
+  }
+}
+
+const DEFAULT_HINT = 'Tap the box, then tap your name from the list.';
 
 async function loadStudents() {
-  const res = await fetch('/api/students');
-  if (isLocked(res)) { goToLogin(); return; }
-  allStudents = await res.json();
+  let res, data;
+  try {
+    res = await fetch('/api/students');
+    data = await readBody(res);
+  } catch (err) {
+    // The whole kiosk hangs on this call: without a catch, a wifi blip on page
+    // load left allStudents empty AND skipped the .then() that focuses the
+    // search box. A student then typed their name into a box that showed
+    // nothing at all - not even "no matching name" - on a screen that looked
+    // perfectly normal, until the 5-minute poll happened to retry.
+    hintEl.textContent = "Can't reach the check-in system. Trying again shortly — "
+                       + 'tell your instructor if this stays up.';
+    return;
+  }
+  if (locksUs(data)) { goToLogin(data.login_url); return; }
+  if (!Array.isArray(data)) {
+    hintEl.textContent = "Can't load the name list right now. Please tell your instructor.";
+    return;
+  }
+
+  /* Keep the object the panel is holding, rather than orphaning it.
+     loadStudents replaces every entry with a fresh object, so a refresh that
+     lands while someone has already tapped their name left selectedStudent
+     pointing at a discarded copy: the action succeeded, but the stage was
+     written onto the orphan, and tapping the same name again offered the step
+     they had just completed. */
+  if (selectedStudent) {
+    const idx = data.findIndex(s => s.id === selectedStudent.id);
+    if (idx !== -1) data[idx] = selectedStudent;
+  }
+
+  allStudents = data;
   if (allStudents.length === 0) {
     hintEl.textContent = 'No students on the list yet — ask your instructor to add you.';
+    return;
   }
+  // Restore the normal hint: whichever message the failures above left on
+  // screen would otherwise stay there for the rest of the day, telling students
+  // the list is empty long after it loaded.
+  hintEl.textContent = DEFAULT_HINT;
+  /* Someone can start typing before the roster arrives - the box is focused the
+     moment the page renders. Their keystrokes matched against an empty list and
+     showed nothing, and no further event was coming to correct it, so the list
+     stayed blank until they typed another letter. Redraw against what just
+     landed. Skipped mid-tap, so a background refresh never reopens the dropdown
+     under someone who has already chosen a name. */
+  if (searchEl.value && !selectedStudent) showSuggestions(searchEl.value);
 }
 
 /* Rank matches: names starting with the query come first, then names with a
@@ -182,36 +260,97 @@ function onSearchKeydown(e) {
   }
 }
 
-/* No waiting and no second request: the roster already says who is checked in,
-   so the right button is decided here and now. Exactly one is ever shown. */
+/* The three steps of a visit, in order. Each stage says what the student can do
+   next: arrive, finish, leave. The roster already carries the stage, so the
+   right button is decided here and now, with no second request. */
+const STAGES = {
+  out: {
+    button: 'btn-checkin',
+    status: s => 'Not checked in yet.',
+    codeLabel: name => `Enter ${name}'s 4-digit code to check in`,
+  },
+  checked_in: {
+    button: 'btn-workdone',
+    status: s => s.check_in_display
+      ? `Checked in at ${s.check_in_display}. Tap below when the work is finished.`
+      : 'Checked in. Tap below when the work is finished.',
+    codeLabel: name => `Enter ${name}'s 4-digit code to finish`,
+  },
+  work_done: {
+    button: 'btn-checkout',
+    // Only claims the parent was emailed when the roster says so. It used to
+    // assert it for every finished student, so after a refresh a student whose
+    // send had failed was told their parent knew.
+    status: s => {
+      const when = s.work_done_display ? `Finished at ${s.work_done_display}` : 'Finished';
+      return s.emailed
+        ? `${when} — parent emailed. Ready for pick-up.`
+        : `${when}. We could not email your parent — please tell your instructor.`;
+    },
+    codeLabel: name => `Enter ${name}'s 4-digit code to check out`,
+  },
+};
+
+const ALL_ACTION_BUTTONS = ['btn-checkin', 'btn-workdone', 'btn-checkout'];
+
+function actionButtons() {
+  return ALL_ACTION_BUTTONS.map(id => document.getElementById(id));
+}
+
 function selectStudent(student) {
   selectedStudent = student;
   closeSuggestions();
   searchEl.value = '';
 
-  const statusEl = document.getElementById('action-status');
-  const checkinBtn = document.getElementById('btn-checkin');
-  const checkoutBtn = document.getElementById('btn-checkout');
+  const stage = STAGES[student.stage] || STAGES.out;
+  actionButtons().forEach(btn => btn.classList.add('hidden'));
+  document.getElementById(stage.button).classList.remove('hidden');
 
-  if (student.checked_in) {
-    statusEl.textContent = student.check_in_display
-      ? `You checked in at ${student.check_in_display}.`
-      : 'You are currently checked in.';
-    checkinBtn.classList.add('hidden');
-    checkoutBtn.classList.remove('hidden');
-  } else {
-    statusEl.textContent = 'You are not checked in yet.';
-    checkoutBtn.classList.add('hidden');
-    checkinBtn.classList.remove('hidden');
-  }
-
+  document.getElementById('action-status').textContent = stage.status(student);
+  document.getElementById('code-label').textContent = stage.codeLabel(student.name);
   document.getElementById('action-name').textContent = student.name;
   document.getElementById('action-panel').classList.remove('hidden');
+
+  const codeEl = document.getElementById('code');
+  codeEl.value = '';
+  codeEl.focus();
+  startIdleTimer();
+}
+
+/* A student who walks away mid-entry must not leave the next person holding
+   their identity.
+ *
+ * Without this, Student A could tap her name, type her 4 digits, get called
+ * away, and Student B would walk up to a panel showing A's name and one big
+ * button. Tapping it acts as A - and if A's next step was "Done with Work",
+ * B's tap sends A's parent the come-and-collect-her email while A is still
+ * working. The code box is type="password" with a four-dot placeholder, so a
+ * filled box and an empty one look identical; B has no way to tell.
+ *
+ * It also unsticks the roster: refreshRoster() skips while a student is
+ * selected, so an abandoned panel used to freeze the cached list for the rest
+ * of the day and overnight, which is the exact thing that poll exists for. */
+const IDLE_RESET_MS = 45 * 1000;
+let idleTimer = null;
+
+function startIdleTimer() {
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => {
+    if (selectedStudent && !actionInFlight) resetPanel();
+  }, IDLE_RESET_MS);
+}
+
+function stopIdleTimer() {
+  clearTimeout(idleTimer);
+  idleTimer = null;
 }
 
 function resetPanel() {
+  stopIdleTimer();
   selectedStudent = null;
   document.getElementById('action-panel').classList.add('hidden');
+  // Never leave a code sitting in the box for whoever walks up next.
+  document.getElementById('code').value = '';
   searchEl.value = '';
   closeSuggestions();
   searchEl.focus();
@@ -247,17 +386,28 @@ let actionInFlight = false;
 
 async function doAction(endpoint, button) {
   // Sending the parent's email takes a moment. Without this guard an impatient
-  // student taps Check Out repeatedly, and every tap is another request.
+  // student taps Done with Work repeatedly, and every tap is another request.
   if (!selectedStudent || actionInFlight) return;
+
+  const codeEl = document.getElementById('code');
+  const code = codeEl.value.trim();
+  // Checked here as well as on the server, purely so an empty box doesn't cost
+  // a round trip - and so it doesn't count against the wrong-code limit.
+  if (code.length !== 4) {
+    showToast('Please enter your 4-digit code.', 'error');
+    codeEl.focus();
+    return;
+  }
+
   actionInFlight = true;
 
-  const checkinBtn = document.getElementById('btn-checkin');
-  const checkoutBtn = document.getElementById('btn-checkout');
   const cancelBtn = document.getElementById('btn-cancel');
+  const buttons = actionButtons();
   const originalLabel = button.textContent;
   const student = selectedStudent;
 
-  checkinBtn.disabled = checkoutBtn.disabled = cancelBtn.disabled = true;
+  buttons.forEach(b => { b.disabled = true; });
+  cancelBtn.disabled = codeEl.disabled = true;
   button.textContent = 'One moment…';
   button.classList.add('is-working');
 
@@ -265,32 +415,55 @@ async function doAction(endpoint, button) {
     const res = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN },
-      body: JSON.stringify({ student_id: student.id }),
+      body: JSON.stringify({ student_id: student.id, code: code }),
     });
-    if (isLocked(res)) { goToLogin(); return; }
-    const data = await res.json();
+    const data = await readBody(res);
+    if (locksUs(data)) { goToLogin(data.login_url); return; }
+    if (!data) {
+      // Reached the server, but it didn't answer with JSON.
+      showToast('Something went wrong at our end. Please tell your instructor.', 'error');
+      loadStudents();
+      resetPanel();
+      return;
+    }
 
     if (res.ok) {
       // Keep the cached roster in step, so tapping the same name again
-      // immediately offers the opposite button. `student` is the very object
-      // held in allStudents, so updating it updates the list.
-      const checkedIn = endpoint === '/api/checkin';
-      student.checked_in = checkedIn;
-      student.check_in_display = checkedIn ? data.time_display : null;
-    } else {
-      // The server disagreed with what we believed - most likely this tablet's
-      // list is stale. Re-read it so the next student isn't shown a guess.
-      loadStudents();
+      // immediately offers the next step. `student` is the very object held in
+      // allStudents, so updating it updates the list.
+      student.stage = data.stage;
+      if (data.stage === 'checked_in') {
+        student.check_in_display = data.time_display;
+        student.work_done_display = null;
+        student.emailed = false;
+      } else if (data.stage === 'work_done') {
+        student.work_done_display = data.time_display;
+        student.emailed = data.email_ok === true;
+      } else {
+        student.check_in_display = null;
+        student.work_done_display = null;
+      }
+      showToast(data.message, data.problem ? 'warn' : 'success', data.problem);
+      resetPanel();
+      return;
     }
 
-    if (!res.ok) {
-      showToast(data.error || 'Something went wrong. Please tell your instructor.', 'error');
-    } else if (data.problem) {
-      // Checked out fine, but their parent was not emailed.
-      showToast(data.message, 'warn', data.problem);
-    } else {
-      showToast(data.message, 'success');
+    // A wrong code is the one failure the student can fix standing there, so
+    // the panel stays open with the box cleared rather than sending them back
+    // to search for their own name again. 429 is the lockout after too many
+    // wrong guesses - that one they cannot fix, so it falls through below.
+    if (res.status === 403) {
+      showToast(data.error || "That code isn't right. Please try again.", 'error');
+      codeEl.value = '';
+      codeEl.focus();
+      return;
     }
+
+    // Anything else means the server disagreed with what this tablet believed -
+    // most likely its list is stale. Re-read it so the next student isn't shown
+    // a guess.
+    loadStudents();
+    showToast(data.error || 'Something went wrong. Please tell your instructor.', 'error');
     resetPanel();
   } catch (err) {
     // Network dropped or the server is down - say so instead of hanging on
@@ -300,7 +473,8 @@ async function doAction(endpoint, button) {
   } finally {
     button.textContent = originalLabel;
     button.classList.remove('is-working');
-    checkinBtn.disabled = checkoutBtn.disabled = cancelBtn.disabled = false;
+    buttons.forEach(b => { b.disabled = false; });
+    cancelBtn.disabled = codeEl.disabled = false;
     actionInFlight = false;
   }
 }
@@ -308,7 +482,17 @@ async function doAction(endpoint, button) {
 searchEl.addEventListener('input', e => showSuggestions(e.target.value));
 searchEl.addEventListener('focus', () => showSuggestions(searchEl.value));
 searchEl.addEventListener('keydown', onSearchKeydown);
-searchEl.addEventListener('blur', () => setTimeout(closeSuggestions, 120));
+/* The delay lets a tap on a name land before the list closes. The handle is
+   kept so refocusing cancels it - tapping out and straight back into the box
+   (the ordinary iOS double-tap) otherwise left an orphaned timer that shut the
+   list again 120ms after it reopened, with the box still focused and no event
+   coming to reopen it. */
+let blurTimer = null;
+searchEl.addEventListener('blur', () => {
+  clearTimeout(blurTimer);
+  blurTimer = setTimeout(closeSuggestions, 120);
+});
+searchEl.addEventListener('focus', () => clearTimeout(blurTimer));
 
 // Tapping anywhere outside the search box closes the list.
 document.addEventListener('click', e => {
@@ -316,8 +500,32 @@ document.addEventListener('click', e => {
 });
 
 document.getElementById('btn-checkin').addEventListener('click', e => doAction('/api/checkin', e.currentTarget));
+document.getElementById('btn-workdone').addEventListener('click', e => doAction('/api/work-done', e.currentTarget));
 document.getElementById('btn-checkout').addEventListener('click', e => doAction('/api/checkout', e.currentTarget));
 document.getElementById('btn-cancel').addEventListener('click', resetPanel);
+
+const codeEl = document.getElementById('code');
+
+/* Digits only. Pasting or a stray letter would otherwise sit in the box looking
+   like a valid entry until the server rejected it. */
+codeEl.addEventListener('input', () => {
+  codeEl.value = codeEl.value.replace(/\D/g, '').slice(0, 4);
+  // Someone typing is not someone who walked away, so the idle countdown
+  // restarts. A student hunting for the right key never gets reset mid-entry.
+  startIdleTimer();
+});
+
+/* Enter submits whichever step is on screen, so a keyboard user never has to
+   reach for the mouse. Escape backs out, matching the search box. */
+codeEl.addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    const visible = actionButtons().find(b => !b.classList.contains('hidden'));
+    if (visible) visible.click();
+  } else if (e.key === 'Escape') {
+    resetPanel();
+  }
+});
 
 /* A tablet is left running for a whole session, and sometimes overnight. The
    nightly close-out happens on the server with nobody tapping anything, so

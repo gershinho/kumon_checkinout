@@ -1,4 +1,4 @@
-"""Sending the check-out notification email to parents, and the nightly report.
+"""Sending the ready-for-pick-up email to parents, and the nightly report.
 
 Returns a status string that gets stored on the visit row. When SMTP isn't
 configured the message is logged instead of sent, so check-in/check-out keeps
@@ -29,10 +29,28 @@ def _log_fallback(student_name: str, recipient_count: int, reason: str, detail: 
           f"{recipient_count} recipient(s){suffix}", flush=True)
 
 
+def _smtp_port() -> int:
+    """The SMTP port, falling back to 587 rather than raising.
+
+    int() on a typo'd value raised ValueError from _smtp_settings, which is
+    called *outside* the try in both senders - so a stray character in the
+    environment 500'd the request after the visit had already been committed as
+    finished, leaving it marked done with no email and no recorded status.
+    """
+    raw = (os.environ.get("SMTP_PORT") or "").strip()
+    if not raw:
+        return 587
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"[email] WARNING: SMTP_PORT={raw!r} is not a number; using 587.", flush=True)
+        return 587
+
+
 def _smtp_settings():
     return {
         "host": os.environ.get("SMTP_HOST", "").strip(),
-        "port": int(os.environ.get("SMTP_PORT") or 587),
+        "port": _smtp_port(),
         "username": os.environ.get("SMTP_USERNAME", "").strip(),
         "password": os.environ.get("SMTP_PASSWORD", ""),
         "from_email": (os.environ.get("FROM_EMAIL", "").strip()
@@ -50,14 +68,23 @@ def _smtp_settings():
 SMTP_TIMEOUT_SECONDS = 10
 
 
-def _send(message, recipients, cfg):
-    """Deliver one message per recipient over SMTP."""
+def _send(message, recipients, cfg) -> int:
+    """Deliver one message per recipient over SMTP. Returns how many were sent.
+
+    Each recipient is attempted separately so one bad address doesn't discard
+    the others. This used to let the exception escape the loop, so a roster with
+    two parent addresses where the second was refused reported the whole send as
+    a failure - the student was told nobody had been notified while the first
+    parent was already driving over. Connection-level failures still raise,
+    because then nothing was delivered and the caller needs to know.
+    """
     context = ssl.create_default_context()
     if cfg["port"] == 465:
         server = smtplib.SMTP_SSL(cfg["host"], cfg["port"],
                                   timeout=SMTP_TIMEOUT_SECONDS, context=context)
     else:
         server = smtplib.SMTP(cfg["host"], cfg["port"], timeout=SMTP_TIMEOUT_SECONDS)
+    delivered = 0
     with server:
         if cfg["port"] != 465:
             server.starttls(context=context)
@@ -66,21 +93,41 @@ def _send(message, recipients, cfg):
         for address in recipients:
             del message["To"]
             message["To"] = address
-            server.send_message(message)
+            try:
+                server.send_message(message)
+                delivered += 1
+            except smtplib.SMTPRecipientsRefused:
+                # This address is bad; the others may be fine. Never log the
+                # address itself - that is the thing encryption at rest exists
+                # to protect.
+                print("[email] one recipient refused; continuing with the rest", flush=True)
+    return delivered
 
 
-def send_checkout_email(to_email: str, student_name: str, checkout_time) -> str:
-    """Send the check-out notification. Returns a status string:
-    'sent', 'not_configured', 'no_address', or 'failed'.
+def send_work_done_email(to_email: str, student_name: str, finished_time) -> str:
+    """Tell a parent their child has finished and can be collected.
+
+    This is the one email the system sends, and it goes out when the student
+    taps "Done with Work" - not at check-out. That is the moment the parent can
+    act on: they are somewhere else, and this is what tells them to set off. By
+    check-out time they are standing at the desk doing it themselves, so an
+    email then would be telling them something they just did.
+
+    Returns a status string: 'sent', 'partial', 'not_configured', 'no_address',
+    or 'failed'. 'partial' means at least one parent address was reached and at
+    least one was refused - worth telling the instructor about, and distinctly
+    not the same as nobody being told.
     """
     recipients = email_recipients(to_email)
     center = os.environ.get("CENTER_NAME", "Kumon").strip() or "Kumon"
-    when = fmt_time(checkout_time)
+    when = fmt_time(finished_time)
 
-    subject = f"{center}: {student_name} checked out at {when}"
+    subject = f"{center}: {student_name} has finished and is ready for pick-up"
     body = (
-        f"{student_name} checked out of {center} at {when} on "
-        f"{checkout_time.strftime('%A, %B')} {checkout_time.day}, {checkout_time.year}.\n\n"
+        f"{student_name} finished their work at {center} at {when} on "
+        f"{finished_time.strftime('%A, %B')} {finished_time.day}, {finished_time.year}, "
+        f"and is ready to be picked up.\n\n"
+        f"Please check {student_name} out at the kiosk when you collect them.\n\n"
         f"This is an automatic message — please don't reply to it.\n"
     )
 
@@ -101,11 +148,19 @@ def send_checkout_email(to_email: str, student_name: str, checkout_time) -> str:
     message.set_content(body)
 
     try:
-        _send(message, recipients, cfg)
-        return "sent"
+        delivered = _send(message, recipients, cfg)
     except Exception as exc:  # noqa: BLE001 - log and keep the app running
         _log_fallback(student_name, len(recipients), "failed", type(exc).__name__)
         return "failed"
+
+    if delivered == 0:
+        _log_fallback(student_name, len(recipients), "failed", "all recipients refused")
+        return "failed"
+    if delivered < len(recipients):
+        _log_fallback(student_name, len(recipients), "partial",
+                      f"{delivered} of {len(recipients)} delivered")
+        return "partial"
+    return "sent"
 
 
 def send_report_email(pdf_bytes: bytes, filename: str, report_date) -> str:

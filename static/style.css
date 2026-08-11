@@ -23,12 +23,20 @@ body {
 a { color: var(--kumon-blue); text-decoration: none; }
 
 .flash-wrap { position: fixed; top: 12px; left: 0; right: 0; display: flex; justify-content: center; z-index: 50; }
+/* Drops in from above the fold. Flash messages carry the thing you most need to
+   read after a click - a new student's code, most of all - so they arrive with
+   a small movement that draws the eye up to them. */
 .flash {
   background: var(--kumon-blue-dark);
   color: white;
   padding: 10px 20px;
   border-radius: 10px;
   font-size: 0.95rem;
+  animation: flash-drop 300ms cubic-bezier(0.2, 0.7, 0.3, 1);
+}
+@keyframes flash-drop {
+  from { opacity: 0; transform: translateY(-14px); }
+  to   { opacity: 1; transform: none; }
 }
 
 /* ---------- Kiosk ---------- */
@@ -125,10 +133,50 @@ body.kiosk { background: var(--kumon-blue-light); }
   text-align: center;
 }
 .action-card h2 { color: var(--kumon-blue); font-size: 1.8rem; margin: 0 0 8px; }
-.action-status { color: var(--muted); margin: 0 0 24px; font-size: 1.05rem; }
+.action-status { color: var(--muted); margin: 0 0 20px; font-size: 1.05rem; }
+
+/* The code box. Big and roomy because it's tapped at arm's length on a tablet,
+   and the digits are spaced out so a parent can see how many they've entered
+   even though the characters themselves are masked. */
+.code-entry { margin: 0 0 20px; }
+.code-entry label {
+  display: block;
+  font-size: 1rem;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+.code-entry input {
+  width: 100%;
+  font-size: 2rem;
+  font-weight: 700;
+  letter-spacing: 0.5em;
+  text-align: center;
+  padding: 16px 12px;
+  /* The letter-spacing adds a gap after the last character too, which shifts
+     everything left of centre without this. */
+  text-indent: 0.5em;
+  border: 2px solid var(--border);
+  border-radius: var(--radius);
+}
+.code-entry input:focus {
+  outline: none;
+  border-color: var(--kumon-blue);
+}
+.code-help { font-size: 0.9rem; color: var(--muted); margin: 8px 0 0; }
 
 .action-buttons { display: flex; flex-direction: column; gap: 14px; }
 
+/* Buttons answer back.
+ *
+ * Every button lifts slightly under the pointer and presses in when clicked,
+ * on a timing that's deliberately lopsided: the press is near-instant (40ms)
+ * and the release is slower (140ms). That asymmetry is what makes a button feel
+ * like a physical thing rather than a rectangle that changes colour - the
+ * response to your finger has to beat your finger.
+ *
+ * Everything here degrades to nothing under prefers-reduced-motion, at the
+ * bottom of this file.
+ */
 .big-btn {
   font-size: 1.4rem;
   font-weight: 700;
@@ -138,25 +186,93 @@ body.kiosk { background: var(--kumon-blue-light); }
   cursor: pointer;
   color: white;
   width: 100%;
+  /* A default colour, not just white text.
+   *
+   * This used to be unset, and only the kiosk buttons and the login card ever
+   * filled it in. Every other .big-btn - Add Student, Show student codes - fell
+   * through to the browser's own button grey and rendered white text on it, at
+   * roughly 1.1:1 contrast. They were legible only because you knew what they
+   * said. Anything wearing this class is a solid, coloured button now, and the
+   * modifiers below override the colour where a different one is meant. */
+  background: var(--kumon-blue);
+  transition: background-color 140ms ease,
+              transform 140ms cubic-bezier(0.2, 0.7, 0.3, 1),
+              box-shadow 140ms ease;
+}
+.big-btn:hover:not(:disabled) {
+  background: var(--kumon-blue-dark);
+  transform: translateY(-1px);
+  box-shadow: 0 6px 18px rgba(0, 60, 115, 0.20);
+}
+.big-btn:active:not(:disabled) {
+  transform: translateY(1px) scale(0.985);
+  box-shadow: 0 1px 3px rgba(0, 60, 115, 0.22);
+  transition-duration: 40ms;
+}
+/* :focus-visible rather than :focus - a mouse click shouldn't leave a ring
+   behind, but tabbing to a button must always show where you are. */
+.big-btn:focus-visible,
+.link-btn:focus-visible {
+  outline: 3px solid var(--kumon-blue);
+  outline-offset: 3px;
 }
 .big-btn.small { font-size: 1rem; padding: 14px 20px; width: auto; }
+/* One colour per step, in the order they happen: green to arrive, amber for
+   finished, blue to leave. Nobody reads a kiosk button, they recognise it. */
+/* The :not(:disabled) is load-bearing, not decoration: it matches the
+   specificity of the generic .big-btn:hover rule above, which would otherwise
+   paint every one of these blue on hover regardless of which step it is. */
 .btn-checkin { background: var(--ok-green); }
-.btn-checkin:hover { background: #256e46; }
+.btn-checkin:hover:not(:disabled) { background: #256e46; }
+.btn-workdone { background: var(--warn-orange); }
+.btn-workdone:hover:not(:disabled) { background: #9a6510; }
 .btn-checkout { background: var(--kumon-blue); }
-.btn-checkout:hover { background: var(--kumon-blue-dark); }
-.btn-checkin.hidden, .btn-checkout.hidden { display: none; }
+.btn-checkout:hover:not(:disabled) { background: var(--kumon-blue-dark); }
+.btn-checkin.hidden, .btn-workdone.hidden, .btn-checkout.hidden { display: none; }
 
-/* While the check-out email is being sent, the buttons stop responding to taps
+/* While the parent's email is being sent, the buttons stop responding to taps
    and say so, so nobody assumes it's broken and keeps pressing. */
 .big-btn:disabled, .link-btn:disabled {
   opacity: 0.6;
   cursor: not-allowed;
 }
+
+/* The button being sent is the one exception: it stays fully opaque and a band
+   of light sweeps across it. A flat grey block is indistinguishable from a
+   broken button, which is exactly the wrong impression during the one or two
+   seconds the mail server is thinking - the movement is what says "still
+   working" rather than "gave up". */
 .big-btn.is-working {
   opacity: 1;
-  background: var(--muted);
+  background-color: var(--muted);
+  background-image: linear-gradient(100deg,
+    rgba(255, 255, 255, 0) 25%,
+    rgba(255, 255, 255, 0.30) 50%,
+    rgba(255, 255, 255, 0) 75%);
+  background-size: 250% 100%;
+  animation: sweep 1.15s linear infinite;
+  transform: none;
+  box-shadow: none;
+}
+@keyframes sweep {
+  from { background-position: 125% 0; }
+  to   { background-position: -125% 0; }
 }
 
+/* The text-button equivalent, for Save / Remove / Regenerate / Email it to me.
+   A sweep needs a filled background to sweep across, so these breathe instead. */
+.is-submitting {
+  animation: breathe 900ms ease-in-out infinite;
+  pointer-events: none;
+}
+@keyframes breathe {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.45; }
+}
+
+/* Text buttons grow a soft pill behind them on hover instead of relying on an
+   underline, so there's a target that visibly reacts before you commit to it.
+   The press is the same squash as the big buttons, scaled down. */
 .link-btn {
   background: none;
   border: none;
@@ -165,7 +281,22 @@ body.kiosk { background: var(--kumon-blue-light); }
   margin-top: 16px;
   cursor: pointer;
   text-decoration: underline;
+  padding: 4px 8px;
+  border-radius: 8px;
+  transition: background-color 120ms ease, color 120ms ease,
+              transform 120ms cubic-bezier(0.2, 0.7, 0.3, 1);
 }
+.link-btn:hover:not(:disabled) {
+  background: var(--kumon-blue-light);
+  text-decoration: none;
+}
+.link-btn:active:not(:disabled) {
+  transform: scale(0.93);
+  transition-duration: 40ms;
+}
+/* Remove is the one destructive button on the page, so its hover is red rather
+   than the friendly blue every other control uses. */
+.link-btn.danger:hover:not(:disabled) { background: #FCEAE8; }
 
 .report-actions {
   display: flex;
@@ -187,6 +318,17 @@ body.kiosk { background: var(--kumon-blue-light); }
   max-width: 90%;
   text-align: center;
   z-index: 30;
+}
+/* Rises up from the bottom edge rather than appearing on top of it. The toast
+   is already translateX(-50%) for centring, so the slide has to be written into
+   the same transform - a second transform property would replace the centring
+   and throw it off to the right. */
+.toast {
+  animation: toast-rise 240ms cubic-bezier(0.2, 0.7, 0.3, 1);
+}
+@keyframes toast-rise {
+  from { opacity: 0; transform: translateX(-50%) translateY(16px); }
+  to   { opacity: 1; transform: translateX(-50%) translateY(0); }
 }
 .toast.hidden { display: none; }
 .toast-success { background: var(--ok-green); }
@@ -238,7 +380,12 @@ body.login-page {
 
 /* ---------- Dashboard ---------- */
 body.dashboard-page { background: #F7FAFD; }
-.dash-wrap { max-width: 1000px; margin: 0 auto; padding: 28px 20px 60px; }
+/* The generous bottom padding is deliberate. The last section holds a dropdown,
+   and a menu opening from a control flush against the bottom of the page has
+   nowhere to go - the browser draws it over the window edge, and no amount of
+   scrolling reaches it because the menu isn't part of the page. Leaving room
+   below the final control means it always opens into empty space. */
+.dash-wrap { max-width: 1000px; margin: 0 auto; padding: 28px 20px 200px; }
 
 .dash-header {
   display: flex;
@@ -331,6 +478,94 @@ body.dashboard-page { background: #F7FAFD; }
   flex: 1;
   min-width: 180px;
 }
+/* Student codes. Hidden behind a button, and styled to be read across a desk:
+   monospace and wide-spaced so 0 and O, 1 and 7 can't be mistaken for each
+   other when a parent is copying one down. */
+.codes-section { margin-bottom: 16px; }
+
+/* Open and close by animating grid-template-rows from 0fr to 1fr.
+ *
+ * The obvious way to do this is max-height, but that means picking a number:
+ * too small clips a long roster, too large makes the close look like it stalls
+ * before anything moves, because most of the animation is spent collapsing
+ * empty space. 0fr -> 1fr animates to the content's real height, whatever it
+ * is, so 3 students and 300 both open at the same honest speed. The inner
+ * wrapper is required - the overflow has to be hidden on the grid item, not the
+ * grid itself. */
+.codes-panel {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transition: grid-template-rows 260ms cubic-bezier(0.3, 0, 0.2, 1),
+              opacity 180ms ease,
+              margin-top 260ms cubic-bezier(0.3, 0, 0.2, 1);
+  margin-top: 0;
+}
+.codes-panel > .codes-panel-inner { overflow: hidden; }
+.codes-panel.is-open {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  margin-top: 14px;
+}
+
+/* The chevron on the toggle points down when closed and flips up when open, so
+   the button says which way it's about to go without reading the label. */
+.codes-toggle-chevron {
+  display: inline-block;
+  margin-left: 8px;
+  transition: transform 260ms cubic-bezier(0.3, 0, 0.2, 1);
+}
+[aria-expanded="true"] .codes-toggle-chevron { transform: rotate(180deg); }
+
+.codes-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 340px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.codes-list li {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.codes-list li:last-child { border-bottom: none; }
+.codes-list form { margin: 0; }
+
+/* A student added from another tab appears here on the next poll. Without this
+   they'd just materialise, and an instructor watching the list would have no
+   idea which row was the new one. The row slides in and holds a highlight long
+   enough to be noticed from across a desk, then settles. */
+.codes-list li.is-new {
+  animation: row-arrive 400ms cubic-bezier(0.2, 0.7, 0.3, 1),
+             row-highlight 2.4s ease-out;
+}
+@keyframes row-arrive {
+  from { opacity: 0; transform: translateY(-8px); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes row-highlight {
+  0%, 35% { background: #FFF6D8; }
+  100%    { background: transparent; }
+}
+.codes-name { flex: 1; font-weight: 600; }
+.codes-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 1.25rem;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  color: var(--kumon-blue);
+  background: var(--kumon-blue-light);
+  padding: 4px 12px;
+  border-radius: 8px;
+}
+
+.muted-cell { color: var(--muted); font-style: italic; }
+
 .student-list-details summary {
   cursor: pointer;
   color: var(--kumon-blue);
@@ -372,6 +607,36 @@ body.dashboard-page { background: #F7FAFD; }
 .update-email-form input:focus { border-color: var(--kumon-blue); }
 .link-btn.danger { color: var(--bad-red); margin-top: 0; }
 
+/* Was completely unstyled: an unclassed button next to a bare input, both
+   falling back to browser defaults in the middle of a styled page. */
+.report-any-date {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+}
+.report-any-date label { color: var(--muted); font-size: 0.95rem; }
+.report-any-date select {
+  padding: 10px 12px;
+  border: 2px solid var(--border);
+  border-radius: 8px;
+  font-size: 0.95rem;
+  background: white;
+  color: var(--text);
+  cursor: pointer;
+  flex: 1;
+  min-width: 220px;
+  transition: border-color 120ms ease;
+}
+.report-any-date select:hover { border-color: var(--kumon-blue); }
+.report-any-date select:focus-visible {
+  outline: none;
+  border-color: var(--kumon-blue);
+}
+
 .dash-reports h2 { color: var(--kumon-blue); font-size: 1.2rem; }
 .reports-list { list-style: none; padding: 0; margin: 0; }
 .reports-list li {
@@ -387,4 +652,33 @@ body.dashboard-page { background: #F7FAFD; }
 @media (max-width: 480px) {
   .kiosk-header h1 { font-size: 1.7rem; }
   .action-card { padding: 24px 20px; }
+}
+
+/* ---------- Motion, for people who don't want it ----------
+ *
+ * Some people get motion sickness or migraines from movement on screen, and set
+ * their operating system to say so. Honouring it is not optional, and it isn't
+ * a downgrade either: every animation above is decoration on top of a state
+ * change that still happens instantly. The panel still opens, the toast still
+ * appears, the button still presses - they just stop travelling to get there.
+ *
+ * The codes panel is the one case needing a real rule rather than a zeroed
+ * duration: it is closed with grid-template-rows: 0fr, so simply removing the
+ * transition would leave it shut. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  .big-btn:hover:not(:disabled),
+  .big-btn:active:not(:disabled),
+  .link-btn:active:not(:disabled) {
+    transform: none;
+  }
+  /* Still needs to be visibly pressed - just without the travel. */
+  .big-btn:active:not(:disabled) { filter: brightness(0.88); }
+  .link-btn:active:not(:disabled) { background: var(--kumon-blue-light); }
+  .codes-toggle-chevron { transition: none; }
 }

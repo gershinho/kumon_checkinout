@@ -1,4 +1,4 @@
-"""One-time database setup.
+"""Database setup and migration.
 
     python setup_db.py                              create tables + instructor login
     python setup_db.py --migrate data/checkinout.db  ...and copy the old SQLite data
@@ -7,6 +7,10 @@ Run this once after creating your Supabase project. Run it again any time you
 change INSTRUCTOR_USERNAME or INSTRUCTOR_PASSWORD in .env - that sync used to
 happen on every app start, which made sense when starting the app was something
 you did by hand, but not when the host restarts it hundreds of times a day.
+
+Also run it after pulling a version that changes the schema. It is safe to run
+as often as you like: every step checks before it acts, so a second run reports
+that there was nothing to do rather than duplicating anything.
 """
 import argparse
 import os
@@ -18,13 +22,26 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 load_dotenv()
 
-from db import LOCKDOWN, SCHEMA, connect  # noqa: E402
+from db import LOCKDOWN, MIGRATIONS, SCHEMA, connect  # noqa: E402
+from student_codes import backfill_codes, with_new_code  # noqa: E402
 
 
 def create_schema(conn):
     conn.execute(SCHEMA)
     conn.commit()
     print("Schema ready (tables, indexes, one-open-visit constraint).")
+
+
+def run_migrations(conn):
+    """Bring an existing database up to date, then make sure every student has
+    a code. Both are no-ops the second time they run."""
+    conn.execute(MIGRATIONS)
+    conn.commit()
+    print("Migrations applied (student codes, work-done stamp, auto-close flag).")
+
+    filled = backfill_codes(conn)
+    if filled:
+        print(f"Generated 4-digit codes for {filled} student(s) that didn't have one.")
 
 
 def lock_down_public_access(conn):
@@ -103,12 +120,15 @@ def migrate_from_sqlite(conn, sqlite_path):
             id_map[s["id"]] = existing["id"]
             updated += 1
         else:
-            new = conn.execute(
-                "INSERT INTO students (name, email_enc, active) VALUES (%s, %s, %s) "
-                "RETURNING id",
-                (s["name"], bytes(s["email_enc"] or b""), s["active"]),
-            ).fetchone()
-            id_map[s["id"]] = new["id"]
+            cur, _code = with_new_code(
+                conn,
+                lambda code, s=s: conn.execute(
+                    "INSERT INTO students (name, email_enc, active, code) "
+                    "VALUES (%s, %s, %s, %s) RETURNING id",
+                    (s["name"], bytes(s["email_enc"] or b""), s["active"], code),
+                ),
+            )
+            id_map[s["id"]] = cur.fetchone()["id"]
             added += 1
 
     # Visit ids are reassigned by Postgres, so student_id has to be remapped
@@ -121,12 +141,27 @@ def migrate_from_sqlite(conn, sqlite_path):
         new_student_id = id_map.get(v["student_id"])
         if new_student_id is None:
             continue  # visit for a student that no longer exists
-        conn.execute(
-            "INSERT INTO visits (student_id, check_in_time, check_out_time, email_status) "
-            "VALUES (%s, %s, %s, %s)",
-            (new_student_id, v["check_in_time"], v["check_out_time"], v["email_status"]),
+        # Old rows recorded "forgot to check out" inside email_status. That is
+        # its own column now, so translate on the way in rather than importing
+        # rows the dashboard would render as an unknown email status.
+        status = v["email_status"]
+        auto_closed = 1 if status == "auto_closed" else 0
+        if auto_closed:
+            status = None
+        # Skip a visit already copied by an earlier run. The module docstring
+        # promises this whole script is safe to re-run, and students have always
+        # been matched by name - but visits were inserted unconditionally, so a
+        # second --migrate silently doubled every visit, doubling every count in
+        # the dashboard and the PDF. Worse, a visit that was still open would
+        # hit the one-open-visit index and abort the entire migration.
+        cur = conn.execute(
+            "INSERT INTO visits (student_id, check_in_time, check_out_time, email_status, "
+            "auto_closed) SELECT %s, %s, %s, %s, %s WHERE NOT EXISTS ("
+            "  SELECT 1 FROM visits WHERE student_id = %s AND check_in_time = %s)",
+            (new_student_id, v["check_in_time"], v["check_out_time"], status, auto_closed,
+             new_student_id, v["check_in_time"]),
         )
-        copied_visits += 1
+        copied_visits += cur.rowcount
 
     conn.commit()
     old.close()
@@ -143,6 +178,7 @@ def main():
 
     with connect() as conn:
         create_schema(conn)
+        run_migrations(conn)
         lock_down_public_access(conn)
         if args.migrate:
             migrate_from_sqlite(conn, args.migrate)

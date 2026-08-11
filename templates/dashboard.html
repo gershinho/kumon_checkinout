@@ -29,8 +29,9 @@
       <thead>
         <tr>
           <th>Student</th>
-          <th>Check-In</th>
-          <th>Check-Out</th>
+          <th>Parent Check-In</th>
+          <th>Done with Work</th>
+          <th>Parent Check-Out</th>
           <th>Parent Email</th>
           <th>Email Status</th>
         </tr>
@@ -41,9 +42,22 @@
           <td>{{ v.name }}</td>
           <td>{{ v.check_in_time|time12 }}</td>
           <td>
+            {% if v.work_done_time %}
+              {{ v.work_done_time|time12 }}
+            {% elif v.check_out_time %}
+              {# Only reachable through the nightly close-out: the kiosk won't
+                 check anyone out who hasn't finished. #}
+              <span class="muted-cell" title="Never marked as finished.">Not marked</span>
+            {% else %}
+              Still working
+            {% endif %}
+          </td>
+          <td>
             {% if v.check_out_time %}
               {{ v.check_out_time|time12 }}
-              {% if v.email_status == 'auto_closed' %}<span class="auto-note">auto</span>{% endif %}
+              {% if v.auto_closed %}<span class="auto-note" title="Nobody checked this student out, so the system closed the visit at {{ close_time_display }}.">auto</span>{% endif %}
+            {% elif v.work_done_time %}
+              Waiting for pick-up
             {% else %}
               Still checked in
             {% endif %}
@@ -52,21 +66,29 @@
           <td>
             {% if v.email_status == 'sent' %}
               <span class="badge badge-ok">Sent</span>
+            {% elif v.email_status == 'partial' %}
+              <span class="badge badge-warn" title="This student has more than one parent address on file and one of them was refused. At least one parent was reached.">Partly sent</span>
             {% elif v.email_status == 'failed' %}
               <span class="badge badge-bad">Failed</span>
             {% elif v.email_status == 'not_configured' %}
               <span class="badge badge-warn">Not configured</span>
             {% elif v.email_status == 'no_address' %}
               <span class="badge badge-bad">No email on file</span>
-            {% elif v.email_status == 'auto_closed' %}
-              <span class="badge badge-muted" title="Forgot to check out — closed automatically at {{ close_time_display }}. No email sent.">No email (forgot to check out)</span>
+            {% elif v.work_done_time %}
+              {# Marked done but no status was ever written: the send was cut off
+                 part-way, so nobody knows whether the parent got it. A bare dash
+                 here would read as "nothing to report". #}
+              <span class="badge badge-bad" title="The student marked their work done, but the result of the email was never recorded — the request was interrupted. Check with this parent.">Unknown</span>
+            {% elif v.check_out_time %}
+              {# The visit is over and the email step never happened. #}
+              <span class="badge badge-muted" title="The parent is emailed when the student marks their work done. That never happened on this visit, so no email was sent.">Never finished</span>
             {% else %}
-              <span class="badge badge-muted">—</span>
+              <span class="badge badge-muted" title="The parent is emailed when the student marks their work done.">Not finished yet</span>
             {% endif %}
           </td>
         </tr>
         {% else %}
-        <tr><td colspan="5" class="empty-row">No check-ins for this date yet.</td></tr>
+        <tr><td colspan="6" class="empty-row">No check-ins for this date yet.</td></tr>
         {% endfor %}
       </tbody>
     </table>
@@ -80,6 +102,39 @@
       <input type="email" name="email" placeholder="Parent email, e.g. parent@example.com" required>
       <button type="submit" class="big-btn small">Add Student</button>
     </form>
+
+    <div class="codes-section">
+      <button type="button" id="codes-toggle" class="big-btn small" aria-expanded="false"
+              aria-controls="codes-panel"><span id="codes-toggle-label">Show student codes</span><span
+              class="codes-toggle-chevron" aria-hidden="true">▾</span></button>
+      {# The inner wrapper is what the open/close animation clips against; the
+         outer div is the grid whose row height is animated. #}
+      <div id="codes-panel" class="codes-panel">
+       <div class="codes-panel-inner">
+        <p class="section-note">
+          Each student types their own code at the kiosk for all three steps.
+          Hand it to the parent, not the wall — anyone who can read a code can
+          check that student in and out. Regenerating one takes effect
+          immediately and the old code stops working.
+        </p>
+        <ul class="codes-list" id="codes-list">
+          {% for s in students %}
+          <li data-student-id="{{ s.id }}">
+            <span class="codes-name">{{ s.name }}</span>
+            <span class="codes-code">{{ s.code or '—' }}</span>
+            <form method="post" action="{{ url_for('regenerate_student_code', student_id=s.id) }}"
+                  data-confirm="Give {{ s.name }} a new code? Their current code will stop working immediately.">
+              <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+              <button type="submit" class="link-btn">Regenerate</button>
+            </form>
+          </li>
+          {% else %}
+          <li class="empty-row">No students yet.</li>
+          {% endfor %}
+        </ul>
+       </div>
+      </div>
+    </div>
 
     <details class="student-list-details">
       <summary>View / edit / remove current students ({{ student_count }})</summary>
@@ -102,7 +157,7 @@
               <button type="submit" class="link-btn">Save</button>
             </form>
             <form method="post" action="{{ url_for('deactivate_student', student_id=s.id) }}"
-                  onsubmit="return confirm('Remove {{ s.name }} from the check-in list?');">
+                  data-confirm="Remove {{ s.name }} from the check-in list?">
               <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
               <button type="submit" class="link-btn danger">Remove</button>
             </form>
@@ -118,11 +173,12 @@
   <section class="dash-reports">
     <h2>Session Reports</h2>
     <p class="section-note">
-      Emailed automatically on {{ report_days_display }} after closing, once
-      everyone still checked in has been closed out for the night — unless fewer
-      than {{ min_visits_for_email + 1 }} students came in, so a holiday doesn't
-      send you a blank report. Quiet days are still downloadable here.
-      Reports are built fresh each time, so nothing expires.
+      The center runs on {{ report_days_display }}, so those are the only days a
+      report covers. Emailed automatically after closing, once everyone still
+      checked in has been closed out for the night — unless fewer than
+      {{ min_visits_for_email + 1 }} students came in, so a holiday doesn't send
+      you a blank report. Quiet days are still downloadable here. Reports are
+      built fresh each time, so nothing expires.
     </p>
     {% if session_dates %}
     <ul class="reports-list">
@@ -142,13 +198,228 @@
     {% else %}
     <p class="empty-row">No session days configured.</p>
     {% endif %}
+    {# A dropdown, not a date picker.
+       Two reasons, both real. The center only meets on {{ report_days_display }},
+       so every other date on a calendar is an empty PDF waiting to happen — a
+       menu can simply not offer them. And a native date picker opens a panel
+       roughly 300px tall from a control sitting at the very bottom of the page,
+       which left it clipped by the window with no way to scroll to it, because
+       the picker is browser furniture rather than part of the page. #}
+    {% if other_session_days %}
     <div class="report-any-date">
-      <label for="reportDate">Any other date</label>
-      <input type="date" id="reportDate" value="{{ today }}" max="{{ today }}">
-      <button type="button" onclick="location.href='/dashboard/reports/' + document.getElementById('reportDate').value">
+      <label for="reportDate">Any other session day</label>
+      {# Grouped by month: a year of session days is a hundred-odd entries, and
+         optgroups turn that from a wall of dates into something you can aim at.
+         The menu scrolls inside itself, so the page below stays the same length
+         however many years the center has been running. #}
+      <select id="reportDate">
+        {% for month, days in other_session_days %}
+        <optgroup label="{{ month }}">
+          {% for d in days %}
+          <option value="{{ d.isoformat() }}">{{ d|datelong }}</option>
+          {% endfor %}
+        </optgroup>
+        {% endfor %}
+      </select>
+      <button type="button" class="big-btn small"
+              onclick="location.href='/dashboard/reports/' + document.getElementById('reportDate').value">
         Download PDF
       </button>
     </div>
+    {% endif %}
   </section>
 </div>
+
+<script>
+const CSRF_TOKEN = {{ csrf_token()|tojson }};
+const REGENERATE_URL = id => `/dashboard/students/${id}/code`;
+
+const codesToggle = document.getElementById('codes-toggle');
+const codesToggleLabel = document.getElementById('codes-toggle-label');
+const codesPanel = document.getElementById('codes-panel');
+const codesList = document.getElementById('codes-list');
+
+function codesOpen() {
+  return codesPanel.classList.contains('is-open');
+}
+
+/* Codes are hidden until asked for. The dashboard gets left open on the office
+   screen, and this is the one thing on the page that is worth reading over an
+   instructor's shoulder. */
+function setCodesVisible(visible) {
+  codesPanel.classList.toggle('is-open', visible);
+  codesToggle.setAttribute('aria-expanded', String(visible));
+  codesToggleLabel.textContent = visible ? 'Hide student codes' : 'Show student codes';
+  // Clipped to zero height is not the same as gone. Without this the collapsed
+  // panel stayed in the tab order and in the accessibility tree: tabbing past
+  // "Add Student" walked into invisible Regenerate buttons - pressing Enter
+  // would invalidate the code of a student the instructor cannot see - and a
+  // screen reader read out every name and code regardless of the toggle.
+  if (visible) {
+    codesPanel.removeAttribute('inert');
+    codesPanel.removeAttribute('aria-hidden');
+    refreshCodes();
+  } else {
+    codesPanel.setAttribute('inert', '');
+    codesPanel.setAttribute('aria-hidden', 'true');
+  }
+}
+
+codesToggle.addEventListener('click', () => setCodesVisible(!codesOpen()));
+
+/* Which students were on screen last time, so the poll can tell a genuinely new
+   arrival from a row that was already there. Seeded from the server-rendered
+   list, otherwise the very first poll would flash every single row as "new". */
+let knownStudentIds = new Set(
+  Array.from(codesList.querySelectorAll('li[data-student-id]'))
+       .map(li => li.dataset.studentId)
+);
+
+/* What the list is currently showing, so an unchanged poll can do nothing.
+   Rebuilding every row on every tick reset the scroll position of this
+   340px-tall scroll container, so an instructor scrolled down reading a code
+   over the phone was thrown back to the top of the alphabet every 30 seconds,
+   losing any text selection mid-copy.
+
+   Seeded from the rows the server already rendered, so the first poll after
+   opening the panel recognises them as unchanged and doesn't rebuild for
+   nothing. */
+let renderedSignature =
+  Array.from(codesList.querySelectorAll('li[data-student-id]'))
+    .map(li => `${li.dataset.studentId}:${li.querySelector('.codes-code').textContent.trim()}`)
+    .join('|') || null;
+
+function signatureOf(students) {
+  return students.map(s => `${s.id}:${s.code}`).join('|');
+}
+
+function renderCodes(students) {
+  const signature = signatureOf(students);
+  if (signature === renderedSignature) return;
+  renderedSignature = signature;
+
+  codesList.textContent = '';
+
+  if (students.length === 0) {
+    const empty = document.createElement('li');
+    empty.className = 'empty-row';
+    empty.textContent = 'No students yet.';
+    codesList.appendChild(empty);
+    knownStudentIds = new Set();
+    return;
+  }
+
+  const seen = new Set();
+
+  students.forEach(s => {
+    const row = document.createElement('li');
+    row.dataset.studentId = s.id;
+    seen.add(String(s.id));
+    // Only a student who wasn't here on the last pass gets the arrival
+    // animation. Re-running it on every 30-second poll would make the whole
+    // list twitch for no reason.
+    if (!knownStudentIds.has(String(s.id))) row.className = 'is-new';
+
+    const name = document.createElement('span');
+    name.className = 'codes-name';
+    // textContent, not innerHTML: a student's name is typed in by hand and
+    // ends up on this page, so it must never be parsed as markup.
+    name.textContent = s.name;
+
+    const code = document.createElement('span');
+    code.className = 'codes-code';
+    code.textContent = s.code || '—';
+
+    const form = document.createElement('form');
+    form.method = 'post';
+    form.action = REGENERATE_URL(s.id);
+    form.addEventListener('submit', e => {
+      if (!confirm(`Give ${s.name} a new code? Their current code will stop working immediately.`)) {
+        e.preventDefault();
+      }
+    });
+
+    const token = document.createElement('input');
+    token.type = 'hidden';
+    token.name = '_csrf';
+    token.value = CSRF_TOKEN;
+
+    const button = document.createElement('button');
+    button.type = 'submit';
+    button.className = 'link-btn';
+    button.textContent = 'Regenerate';
+
+    form.append(token, button);
+    row.append(name, code, form);
+    codesList.appendChild(row);
+  });
+
+  knownStudentIds = seen;
+}
+
+/* Re-read the list so a student added from another tab - or by the importer -
+   shows up without anyone reloading this page. Only while the panel is open:
+   polling for something nobody is looking at wakes the server for nothing. */
+async function refreshCodes() {
+  if (!codesOpen()) return;
+  try {
+    const res = await fetch('/api/student-codes');
+    if (!res.ok) return;   // session expired or similar; the next reload sorts it out
+    renderCodes(await res.json());
+  } catch (err) {
+    // Leave whatever is on screen. It is at most 30 seconds stale, which beats
+    // blanking the list because the network hiccuped.
+  }
+}
+
+setInterval(refreshCodes, 30 * 1000);
+
+/* Confirmations come from a data-confirm attribute, not an inline onsubmit.
+ *
+ * The old form was an onsubmit attribute containing confirm('Remove NAME?')
+ * with the name interpolated into the JavaScript string. Jinja escapes an
+ * apostrophe to a character reference, but that is an HTML escape, and the
+ * browser decodes references in an attribute BEFORE compiling it as JS - so a
+ * student named O'Brien closed the string early and made the handler a syntax
+ * error. A handler that fails to compile is null, and null blocks nothing:
+ * Remove and Regenerate fired on the first click with no dialog at all. A name
+ * chosen to look like code would have run as code.
+ *
+ * Read as a DOM attribute the value is only ever text, so any name is safe and
+ * the dialog always appears. Capture phase, so it runs before the in-flight
+ * marking below and declining leaves the button untouched. */
+document.addEventListener('submit', e => {
+  const message = e.target instanceof HTMLFormElement && e.target.dataset.confirm;
+  if (message && !confirm(message)) e.preventDefault();
+}, true);
+
+/* Every button on this page submits a form, which means a round trip and a full
+   page reload. Between the click and the new page arriving there was nothing at
+   all - on a slow connection that reads as a button that didn't work, and the
+   instructor clicks it again. Marking the button that was clicked gives the
+   wait an owner, and stops the second click while it's in flight.
+ *
+ * The defaultPrevented check is what covers backing out of a confirm dialog:
+ * the handler above cancels the submit, but the event still bubbles here, so
+ * without it a declined Remove would leave its button frozen. */
+document.addEventListener('submit', e => {
+  if (e.defaultPrevented) return;
+  const button = e.submitter;   // undefined on older Safari; then no feedback, no harm
+  if (!button || button.disabled) return;
+  button.classList.add(button.classList.contains('big-btn') ? 'is-working' : 'is-submitting');
+  // Disabling immediately would drop the button's name from the POST body, and
+  // the browser reads that when the form is serialised - so wait a tick.
+  setTimeout(() => { button.disabled = true; }, 0);
+});
+
+/* Coming back via the browser's Back button can serve the page from memory
+   exactly as it was left - including a button still frozen mid-submit. */
+window.addEventListener('pageshow', e => {
+  if (!e.persisted) return;
+  document.querySelectorAll('.is-working, .is-submitting').forEach(b => {
+    b.classList.remove('is-working', 'is-submitting');
+    b.disabled = false;
+  });
+});
+</script>
 {% endblock %}
